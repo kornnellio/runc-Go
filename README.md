@@ -852,9 +852,6 @@ runc-go/
 ├── Makefile                   # Build, test, and install targets
 ├── README.md                  # This file
 │
-├── .github/workflows/         # CI/CD configuration
-│   └── ci.yml                 # GitHub Actions workflow
-│
 ├── spec/                      # OCI Specification types
 │   ├── spec.go                # config.json schema (all struct definitions)
 │   ├── spec_test.go           # Tests for spec types
@@ -1016,18 +1013,6 @@ make fmt
 make check
 ```
 
-### Continuous Integration
-
-The project uses GitHub Actions for CI:
-
-- **Multi-version testing**: Go 1.21, 1.22, 1.23
-- **Linting**: golangci-lint
-- **Security scanning**: gosec
-- **Format checking**: gofmt
-- **Coverage reporting**: Codecov
-
-CI runs automatically on pushes and pull requests to main.
-
 ---
 
 ## Differences from Production runc
@@ -1044,7 +1029,7 @@ This is an **educational implementation**. Key differences from the real `runc`:
 | **systemd integration** | No | Yes |
 | **Console handling** | Basic | Full PTY support |
 | **Error handling** | Minimal | Comprehensive |
-| **Testing** | Unit tests + CI | Extensive test suite |
+| **Testing** | Unit tests | Extensive test suite |
 
 ### What's Missing?
 
@@ -1064,7 +1049,7 @@ This is an **educational implementation**. Key differences from the real `runc`:
 - Capability dropping
 - Basic seccomp filtering
 - Proper create/start separation
-- Unit test suite with CI/CD
+- Unit test suite
 - Makefile for easy building and testing
 
 ---
