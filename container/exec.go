@@ -4,10 +4,15 @@ package container
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"syscall"
+	"unsafe"
+
+	"golang.org/x/term"
 
 	"runc-go/linux"
 	"runc-go/spec"
@@ -98,9 +103,6 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 
 	// Build the exec-init command
 	cmd := exec.Command(self, "exec-init")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
 	// Pass information via environment
 	cmd.Env = append(os.Environ(),
@@ -117,9 +119,15 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 
 	if opts.Tty {
 		cmd.Env = append(cmd.Env, "_RUNC_GO_EXEC_TTY=1")
+		return execWithPTY(cmd, opts)
 	}
 
-	// Start the process (don't wait yet, we need the PID)
+	// Non-TTY mode: just pass through stdin/stdout/stderr
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Start the process
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start exec process: %w", err)
 	}
@@ -142,6 +150,137 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 	}
 
 	return nil
+}
+
+// execWithPTY runs the command with a pseudo-terminal for interactive use.
+func execWithPTY(cmd *exec.Cmd, opts *ExecOptions) error {
+	// Open PTY master
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/ptmx: %w", err)
+	}
+	defer ptmx.Close()
+
+	// Get the slave PTY number
+	var ptyNum uint32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyNum))); errno != 0 {
+		return fmt.Errorf("get pty number: %v", errno)
+	}
+
+	// Unlock the slave PTY
+	var unlock int32 = 0
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
+		return fmt.Errorf("unlock pty: %v", errno)
+	}
+
+	// Open slave PTY
+	slavePath := fmt.Sprintf("/dev/pts/%d", ptyNum)
+	slave, err := os.OpenFile(slavePath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open slave pty %s: %w", slavePath, err)
+	}
+	defer slave.Close()
+
+	// Set up the command to use the slave PTY
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+	}
+
+	// Put terminal into raw mode (only if stdin is a terminal)
+	var oldState *term.State
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return fmt.Errorf("make terminal raw: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+		// Copy terminal size to PTY
+		copyTerminalSize(os.Stdin, ptmx)
+
+		// Handle window size changes
+		sigwinch := make(chan os.Signal, 1)
+		signal.Notify(sigwinch, syscall.SIGWINCH)
+		go func() {
+			for range sigwinch {
+				copyTerminalSize(os.Stdin, ptmx)
+			}
+		}()
+		defer signal.Stop(sigwinch)
+	}
+
+	// Start the process
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start exec process: %w", err)
+	}
+
+	// Close slave in parent (child has it)
+	slave.Close()
+
+	// Write PID file if requested
+	if opts.PidFile != "" {
+		pidContent := fmt.Sprintf("%d", cmd.Process.Pid)
+		if err := os.WriteFile(opts.PidFile, []byte(pidContent), 0644); err != nil {
+			cmd.Process.Kill()
+			return fmt.Errorf("write pid file: %w", err)
+		}
+	}
+
+	// Copy I/O between terminal and PTY
+	done := make(chan struct{})
+	go func() {
+		io.Copy(ptmx, os.Stdin)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(os.Stdout, ptmx)
+		done <- struct{}{}
+	}()
+
+	// Wait for the process to complete
+	err = cmd.Wait()
+
+	// Wait for I/O goroutines
+	<-done
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
+
+	return nil
+}
+
+// copyTerminalSize copies the terminal size from src to dst.
+func copyTerminalSize(src, dst *os.File) {
+	width, height, err := term.GetSize(int(src.Fd()))
+	if err != nil {
+		return
+	}
+	setTerminalSize(dst, width, height)
+}
+
+// winsize is the struct for TIOCSWINSZ ioctl.
+type winsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
+// setTerminalSize sets the terminal size.
+func setTerminalSize(f *os.File, width, height int) {
+	ws := winsize{
+		Row: uint16(height),
+		Col: uint16(width),
+	}
+	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
 }
 
 // ExecInit is called to actually join the container and exec.
