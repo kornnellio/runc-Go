@@ -453,10 +453,11 @@ func cmdExec() error {
 	}
 
 	opts := &container.ExecOptions{
-		Tty:     args.has("tty") || args.has("t"),
-		Cwd:     args.get("cwd"),
-		Detach:  args.has("detach") || args.has("d"),
-		PidFile: args.get("pid-file"),
+		Tty:           args.has("tty") || args.has("t"),
+		Cwd:           args.get("cwd"),
+		Detach:        args.has("detach") || args.has("d"),
+		PidFile:       args.get("pid-file"),
+		ConsoleSocket: args.get("console-socket"),
 	}
 
 	// Parse environment variables

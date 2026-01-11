@@ -5,16 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/term"
 
-	"runc-go/linux"
 	"runc-go/spec"
 )
 
@@ -37,6 +36,9 @@ type ExecOptions struct {
 
 	// PidFile writes the process ID to a file.
 	PidFile string
+
+	// ConsoleSocket is the path to a unix socket for PTY master.
+	ConsoleSocket string
 }
 
 // ExecWithProcessFile executes using a process spec file (Docker/containerd style).
@@ -105,11 +107,12 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 	cmd := exec.Command(self, "exec-init")
 
 	// Pass information via environment
+	encodedArgs := encodeArgs(args)
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("_RUNC_GO_EXEC_PID=%d", c.InitProcess),
 		fmt.Sprintf("_RUNC_GO_EXEC_ROOTFS=%s", c.State.Rootfs),
 		fmt.Sprintf("_RUNC_GO_EXEC_CWD=%s", getCwd(opts, c)),
-		fmt.Sprintf("_RUNC_GO_EXEC_ARGS=%s", encodeArgs(args)),
+		fmt.Sprintf("_RUNC_GO_EXEC_ARGS=%s", encodedArgs),
 	)
 
 	// Add additional env vars
@@ -117,6 +120,12 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 		cmd.Env = append(cmd.Env, "_RUNC_GO_EXEC_ENV_"+e)
 	}
 
+	// Handle TTY with console socket (containerd style)
+	if opts.Tty && opts.ConsoleSocket != "" {
+		return execWithConsoleSocket(cmd, opts)
+	}
+
+	// Handle TTY without console socket (direct terminal)
 	if opts.Tty {
 		cmd.Env = append(cmd.Env, "_RUNC_GO_EXEC_TTY=1")
 		return execWithPTY(cmd, opts)
@@ -141,6 +150,11 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 		}
 	}
 
+	// If detached, exit immediately
+	if opts.Detach {
+		return nil
+	}
+
 	// Wait for the process to complete
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -159,7 +173,7 @@ func execWithPTY(cmd *exec.Cmd, opts *ExecOptions) error {
 	if err != nil {
 		return fmt.Errorf("open /dev/ptmx: %w", err)
 	}
-	defer ptmx.Close()
+	// Note: ptmx is closed explicitly after cmd.Wait() to signal EOF
 
 	// Get the slave PTY number
 	var ptyNum uint32
@@ -231,23 +245,121 @@ func execWithPTY(cmd *exec.Cmd, opts *ExecOptions) error {
 	}
 
 	// Copy I/O between terminal and PTY
-	done := make(chan struct{})
 	go func() {
 		io.Copy(ptmx, os.Stdin)
-		done <- struct{}{}
 	}()
+
+	outputDone := make(chan struct{})
 	go func() {
 		io.Copy(os.Stdout, ptmx)
-		done <- struct{}{}
+		close(outputDone)
 	}()
 
 	// Wait for the process to complete
 	err = cmd.Wait()
 
-	// Wait for I/O goroutines
-	<-done
+	// Close PTY to signal EOF to output goroutine
+	ptmx.Close()
+
+	// Wait for output to be flushed
+	<-outputDone
 
 	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
+
+	return nil
+}
+
+// execWithConsoleSocket runs with PTY and sends master FD to console socket.
+// This is used by containerd to handle the PTY I/O.
+func execWithConsoleSocket(cmd *exec.Cmd, opts *ExecOptions) error {
+	// Open PTY master
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/ptmx: %w", err)
+	}
+	defer ptmx.Close()
+
+	// Get the slave PTY number
+	var ptyNum uint32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyNum))); errno != 0 {
+		return fmt.Errorf("get pty number: %v", errno)
+	}
+
+	// Unlock the slave PTY
+	var unlock int32 = 0
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
+		return fmt.Errorf("unlock pty: %v", errno)
+	}
+
+	// Open slave PTY
+	slavePath := fmt.Sprintf("/dev/pts/%d", ptyNum)
+	slave, err := os.OpenFile(slavePath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open slave pty %s: %w", slavePath, err)
+	}
+	defer slave.Close()
+
+	// Set up the command to use the slave PTY
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+	}
+
+	// Start the process
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start exec process: %w", err)
+	}
+
+	// Close slave in parent (child has it)
+	slave.Close()
+
+	// Send PTY master to console socket
+	conn, err := net.Dial("unix", opts.ConsoleSocket)
+	if err != nil {
+		cmd.Process.Kill()
+		return fmt.Errorf("connect to console socket: %w", err)
+	}
+	defer conn.Close()
+
+	// Send the PTY master FD over the unix socket
+	unixConn := conn.(*net.UnixConn)
+	f, err := unixConn.File()
+	if err != nil {
+		cmd.Process.Kill()
+		return fmt.Errorf("get socket file: %w", err)
+	}
+	defer f.Close()
+
+	rights := syscall.UnixRights(int(ptmx.Fd()))
+	if err := syscall.Sendmsg(int(f.Fd()), []byte{0}, rights, nil, 0); err != nil {
+		cmd.Process.Kill()
+		return fmt.Errorf("send pty fd: %w", err)
+	}
+
+	// Write PID file if requested
+	if opts.PidFile != "" {
+		pidContent := fmt.Sprintf("%d", cmd.Process.Pid)
+		if err := os.WriteFile(opts.PidFile, []byte(pidContent), 0644); err != nil {
+			cmd.Process.Kill()
+			return fmt.Errorf("write pid file: %w", err)
+		}
+	}
+
+	// If detached, exit immediately
+	if opts.Detach {
+		return nil
+	}
+
+	// Wait for the process to complete
+	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
@@ -284,20 +396,16 @@ func setTerminalSize(f *os.File, width, height int) {
 }
 
 // ExecInit is called to actually join the container and exec.
-// This runs in a separate process that will join namespaces.
+// This uses nsenter to properly join all namespaces (including mount).
 func ExecInit() error {
 	// Get parameters from environment
 	pidStr := os.Getenv("_RUNC_GO_EXEC_PID")
-	rootfs := os.Getenv("_RUNC_GO_EXEC_ROOTFS")
 	cwd := os.Getenv("_RUNC_GO_EXEC_CWD")
 	argsStr := os.Getenv("_RUNC_GO_EXEC_ARGS")
 
 	if pidStr == "" || argsStr == "" {
 		return fmt.Errorf("missing exec environment variables")
 	}
-
-	var pid int
-	fmt.Sscanf(pidStr, "%d", &pid)
 
 	args := decodeArgs(argsStr)
 	if len(args) == 0 {
@@ -312,84 +420,53 @@ func ExecInit() error {
 		}
 	}
 
-	// Join namespaces of the container
-	nsTypes := []struct {
-		name   string
-		nsType spec.LinuxNamespaceType
-	}{
-		{"ipc", spec.IPCNamespace},
-		{"uts", spec.UTSNamespace},
-		{"net", spec.NetworkNamespace},
-		{"pid", spec.PIDNamespace},
-		{"mnt", spec.MountNamespace},
-		{"cgroup", spec.CgroupNamespace},
+	// Build nsenter command to join all namespaces
+	// nsenter -t <pid> -m -u -i -n -p [--wd <cwd>] <command>
+	nsenterArgs := []string{
+		"-t", pidStr,
+		"-m", // mount namespace
+		"-u", // UTS namespace
+		"-i", // IPC namespace
+		"-n", // network namespace
+		"-p", // PID namespace
 	}
 
-	for _, ns := range nsTypes {
-		nsPath := filepath.Join("/proc", pidStr, "ns", ns.name)
-		if _, err := os.Stat(nsPath); err == nil {
-			if err := joinNamespace(nsPath, ns.nsType); err != nil {
-				// Some namespaces may not be available, continue
-				fmt.Fprintf(os.Stderr, "[exec] warning: join %s namespace: %v\n", ns.name, err)
-			}
-		}
+	// Add separator and the command to execute
+	nsenterArgs = append(nsenterArgs, "--")
+
+	// If cwd specified, use sh -c with cd
+	if cwd != "" && cwd != "/" {
+		shellCmd := fmt.Sprintf("cd %s && exec %s", cwd, shellQuoteArgs(args))
+		nsenterArgs = append(nsenterArgs, "sh", "-c", shellCmd)
+	} else {
+		nsenterArgs = append(nsenterArgs, args...)
 	}
 
-	// Change to container's root if available
-	if rootfs != "" {
-		// We're already in the mount namespace, so we should be able to
-		// access the container's view of the filesystem.
-		// The root from the container's perspective is /
-		if err := syscall.Chdir("/"); err != nil {
-			fmt.Fprintf(os.Stderr, "[exec] warning: chdir /: %v\n", err)
-		}
+	// Build environment (filter out our internal vars, add container PATH)
+	env := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/root",
+		"TERM=xterm",
 	}
-
-	// Change to working directory
-	if cwd != "" {
-		if err := syscall.Chdir(cwd); err != nil {
-			return fmt.Errorf("chdir %s: %w", cwd, err)
-		}
-	}
-
-	// Clear the internal env vars and add extra ones
-	env := []string{}
 	for _, e := range os.Environ() {
 		if len(e) < 13 || e[:13] != "_RUNC_GO_EXEC" {
+			// Skip PATH since we set container-appropriate one above
+			if len(e) > 5 && e[:5] == "PATH=" {
+				continue
+			}
 			env = append(env, e)
 		}
 	}
 	env = append(env, extraEnv...)
 
-	// Find the executable
-	execPath, err := exec.LookPath(args[0])
+	// Find nsenter
+	nsenterPath, err := exec.LookPath("nsenter")
 	if err != nil {
-		// Try with /proc/1/root prefix if in container
-		containerPath := filepath.Join("/proc", pidStr, "root", args[0])
-		if _, statErr := os.Stat(containerPath); statErr == nil {
-			execPath = containerPath
-		} else {
-			return fmt.Errorf("executable not found: %s", args[0])
-		}
+		return fmt.Errorf("nsenter not found: %w", err)
 	}
 
-	// Exec the command
-	return syscall.Exec(execPath, args, env)
-}
-
-// joinNamespace joins a namespace by path.
-func joinNamespace(path string, nsType spec.LinuxNamespaceType) error {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer syscall.Close(fd)
-
-	_, _, errno := syscall.Syscall(linux.SYS_SETNS, uintptr(fd), 0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	// Exec nsenter (replaces this process)
+	return syscall.Exec(nsenterPath, append([]string{"nsenter"}, nsenterArgs...), env)
 }
 
 // getCwd returns the working directory for exec.
@@ -418,4 +495,33 @@ func decodeArgs(encoded string) []string {
 	var args []string
 	json.Unmarshal([]byte(encoded), &args)
 	return args
+}
+
+// shellQuoteArgs quotes arguments for shell.
+func shellQuoteArgs(args []string) string {
+	var quoted []string
+	for _, arg := range args {
+		// Simple quoting - wrap in single quotes, escape existing single quotes
+		escaped := ""
+		for _, c := range arg {
+			if c == '\'' {
+				escaped += `'\''`
+			} else {
+				escaped += string(c)
+			}
+		}
+		quoted = append(quoted, "'"+escaped+"'")
+	}
+	return fmt.Sprintf("%s", joinStrings(quoted, " "))
+}
+
+func joinStrings(strs []string, sep string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	result := strs[0]
+	for _, s := range strs[1:] {
+		result += sep + s
+	}
+	return result
 }
