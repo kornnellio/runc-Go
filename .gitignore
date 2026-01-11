@@ -1,6 +1,9 @@
 # Binary
 runc-go
 
+# Documentation (internal)
+DOCS/
+
 # Build artifacts
 build/
 coverage/

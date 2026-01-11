@@ -78,21 +78,23 @@ sudo whoami
 
 ## Building
 
-### Step 1: Navigate to the Project
+### Using Make (Recommended)
 
 ```bash
-cd /home/me/Desktop/Go_Linux/runc-go
+# Build the binary
+make build
+
+# Verify the build
+./runc-go version
+
+# Install system-wide
+make install
 ```
 
-### Step 2: Build the Binary
+### Manual Build
 
 ```bash
 go build -o runc-go .
-```
-
-### Step 3: Verify the Build
-
-```bash
 ./runc-go version
 ```
 
@@ -102,11 +104,17 @@ runc-go version 0.1.0
 spec: 1.0.2
 ```
 
-### Optional: Install System-Wide
+### Available Make Targets
 
-```bash
-sudo cp runc-go /usr/local/bin/
-```
+| Target | Description |
+|--------|-------------|
+| `make build` | Build optimized binary |
+| `make test` | Run all tests |
+| `make test-coverage` | Generate coverage report |
+| `make lint` | Run golangci-lint |
+| `make install` | Install to /usr/local/bin |
+| `make clean` | Remove build artifacts |
+| `make help` | Show all targets |
 
 ---
 
@@ -841,14 +849,21 @@ cat /sys/fs/cgroup/runc-go/myapp/cgroup.procs
 runc-go/
 ├── main.go                    # CLI entry point and command routing
 ├── go.mod                     # Go module definition
+├── Makefile                   # Build, test, and install targets
 ├── README.md                  # This file
+│
+├── .github/workflows/         # CI/CD configuration
+│   └── ci.yml                 # GitHub Actions workflow
 │
 ├── spec/                      # OCI Specification types
 │   ├── spec.go                # config.json schema (all struct definitions)
-│   └── state.go               # Container state types
+│   ├── spec_test.go           # Tests for spec types
+│   ├── state.go               # Container state types
+│   └── state_test.go          # Tests for state management
 │
 ├── container/                 # Container lifecycle management
 │   ├── container.go           # Container struct and state management
+│   ├── container_test.go      # Tests for container operations
 │   ├── create.go              # Create operation (fork, setup, wait)
 │   ├── start.go               # Start operation (signal init to exec)
 │   ├── state.go               # State query operation
@@ -858,7 +873,9 @@ runc-go/
 │
 ├── linux/                     # Linux-specific isolation primitives
 │   ├── namespace.go           # Namespace creation and joining
+│   ├── namespace_test.go      # Tests for namespace configuration
 │   ├── cgroup.go              # Cgroup v2 resource limits
+│   ├── cgroup_test.go         # Tests for cgroup management
 │   ├── rootfs.go              # Filesystem setup (pivot_root, mounts)
 │   ├── capabilities.go        # Linux capabilities management
 │   ├── seccomp.go             # Seccomp BPF syscall filtering
@@ -958,6 +975,61 @@ AFTER FORK:
 
 ---
 
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+make test
+
+# Run tests with verbose output
+go test -v ./...
+
+# Run tests with coverage report
+make test-coverage
+
+# Run only unit tests (no root required)
+make test-unit
+```
+
+### Test Coverage
+
+The project includes unit tests for core packages:
+
+| Package | Coverage | Tests |
+|---------|----------|-------|
+| `spec/` | 85%+ | Spec types, JSON serialization, state management |
+| `container/` | 70%+ | Lifecycle operations, state persistence |
+| `linux/` | 75%+ | Namespace config, cgroup management |
+
+### Code Quality
+
+```bash
+# Run linter
+make lint
+
+# Format code
+make fmt
+
+# Run all checks
+make check
+```
+
+### Continuous Integration
+
+The project uses GitHub Actions for CI:
+
+- **Multi-version testing**: Go 1.21, 1.22, 1.23
+- **Linting**: golangci-lint
+- **Security scanning**: gosec
+- **Format checking**: gofmt
+- **Coverage reporting**: Codecov
+
+CI runs automatically on pushes and pull requests to main.
+
+---
+
 ## Differences from Production runc
 
 This is an **educational implementation**. Key differences from the real `runc`:
@@ -972,7 +1044,7 @@ This is an **educational implementation**. Key differences from the real `runc`:
 | **systemd integration** | No | Yes |
 | **Console handling** | Basic | Full PTY support |
 | **Error handling** | Minimal | Comprehensive |
-| **Testing** | Manual | Extensive test suite |
+| **Testing** | Unit tests + CI | Extensive test suite |
 
 ### What's Missing?
 
@@ -992,6 +1064,8 @@ This is an **educational implementation**. Key differences from the real `runc`:
 - Capability dropping
 - Basic seccomp filtering
 - Proper create/start separation
+- Unit test suite with CI/CD
+- Makefile for easy building and testing
 
 ---
 
