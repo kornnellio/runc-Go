@@ -1,0 +1,26 @@
+# Binary
+runc-go
+
+# Build artifacts
+build/
+coverage/
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.test
+*.prof
+
+# Temporary files
+*.tmp
+*.log

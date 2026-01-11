@@ -86,7 +86,7 @@ func (s *ContainerState) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 // ToOCIState returns just the OCI-compliant state portion.
