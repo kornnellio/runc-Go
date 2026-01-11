@@ -130,6 +130,10 @@ parseCommand:
 		err = cmdSpec()
 	case "init":
 		err = cmdInit()
+	case "exec":
+		err = cmdExec()
+	case "exec-init":
+		err = cmdExecInit()
 	case "version", "--version", "-v":
 		fmt.Printf("runc-go version %s\n", version)
 		fmt.Printf("spec: %s\n", specVer)
@@ -158,6 +162,7 @@ Commands:
   create <container-id> <bundle>   Create a container
   start <container-id>             Start a created container
   run <container-id> <bundle>      Create and start a container
+  exec <container-id> <command>    Execute a command in a running container
   state <container-id>             Output the state of a container
   kill <container-id> [signal]     Send a signal to a container (default: SIGTERM)
   delete <container-id>            Delete a container
@@ -170,6 +175,8 @@ Options:
   --pid-file <path>    Write container PID to file
   --console-socket     Socket for console (not implemented)
   -f, --force          Force action (for delete)
+  -t, --tty            Allocate a pseudo-TTY (for exec)
+  --cwd <path>         Working directory inside container (for exec)
 
 Examples:
   # Create a container from a bundle
@@ -180,6 +187,9 @@ Examples:
 
   # Or create and start in one step
   runc-go run mycontainer /path/to/bundle
+
+  # Execute a command in a running container
+  runc-go exec mycontainer /bin/sh
 
   # Check container state
   runc-go state mycontainer
@@ -427,6 +437,59 @@ func cmdSpec() error {
 func cmdInit() error {
 	// This is called inside the container namespace
 	return container.InitContainer()
+}
+
+func cmdExec() error {
+	args := parseArgs(os.Args[2:])
+
+	containerID := args.pos(0)
+	if containerID == "" {
+		return fmt.Errorf("container ID required")
+	}
+
+	root := globalRoot
+	if root == "" {
+		root = args.get("root")
+	}
+
+	opts := &container.ExecOptions{
+		Tty:     args.has("tty") || args.has("t"),
+		Cwd:     args.get("cwd"),
+		Detach:  args.has("detach") || args.has("d"),
+		PidFile: args.get("pid-file"),
+	}
+
+	// Parse environment variables
+	if envVal := args.get("env"); envVal != "" {
+		opts.Env = append(opts.Env, envVal)
+	}
+
+	// Check if --process flag is used (Docker/containerd style)
+	processFile := args.get("process")
+	if processFile != "" {
+		return container.ExecWithProcessFile(containerID, root, processFile, opts)
+	}
+
+	// Get command to execute (remaining positional args after container ID)
+	var execArgs []string
+	for i := 1; ; i++ {
+		arg := args.pos(i)
+		if arg == "" {
+			break
+		}
+		execArgs = append(execArgs, arg)
+	}
+
+	if len(execArgs) == 0 {
+		return fmt.Errorf("command required")
+	}
+
+	return container.Exec(containerID, root, execArgs, opts)
+}
+
+func cmdExecInit() error {
+	// This is called to join container namespaces and exec
+	return container.ExecInit()
 }
 
 // args is a simple argument parser
