@@ -2,7 +2,7 @@
 
 # Build configuration
 BINARY_NAME := runc-go
-GO := go
+GO := $(shell which go 2>/dev/null || echo "/home/me/go/bin/go")
 GOFLAGS := -ldflags="-s -w"
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
