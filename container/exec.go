@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -173,7 +174,13 @@ func execWithPTY(cmd *exec.Cmd, opts *ExecOptions) error {
 	if err != nil {
 		return fmt.Errorf("open /dev/ptmx: %w", err)
 	}
-	// Note: ptmx is closed explicitly after cmd.Wait() to signal EOF
+	// Ensure PTY is closed on all paths (prevents FD leak)
+	ptmxClosed := false
+	defer func() {
+		if !ptmxClosed {
+			ptmx.Close()
+		}
+	}()
 
 	// Get the slave PTY number
 	var ptyNum uint32
@@ -260,6 +267,7 @@ func execWithPTY(cmd *exec.Cmd, opts *ExecOptions) error {
 
 	// Close PTY to signal EOF to output goroutine
 	ptmx.Close()
+	ptmxClosed = true
 
 	// Wait for output to be flushed
 	<-outputDone
@@ -330,7 +338,11 @@ func execWithConsoleSocket(cmd *exec.Cmd, opts *ExecOptions) error {
 	defer conn.Close()
 
 	// Send the PTY master FD over the unix socket
-	unixConn := conn.(*net.UnixConn)
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		cmd.Process.Kill()
+		return fmt.Errorf("expected unix socket connection")
+	}
 	f, err := unixConn.File()
 	if err != nil {
 		cmd.Process.Kill()
@@ -435,8 +447,9 @@ func ExecInit() error {
 	nsenterArgs = append(nsenterArgs, "--")
 
 	// If cwd specified, use sh -c with cd
+	// SECURITY: Quote cwd to prevent shell injection
 	if cwd != "" && cwd != "/" {
-		shellCmd := fmt.Sprintf("cd %s && exec %s", cwd, shellQuoteArgs(args))
+		shellCmd := fmt.Sprintf("cd %s && exec %s", shellQuoteArg(cwd), shellQuoteArgs(args))
 		nsenterArgs = append(nsenterArgs, "sh", "-c", shellCmd)
 	} else {
 		nsenterArgs = append(nsenterArgs, args...)
@@ -497,22 +510,32 @@ func decodeArgs(encoded string) []string {
 	return args
 }
 
+// shellQuoteArg quotes a single argument for safe shell execution.
+// Uses single quotes and escapes embedded single quotes.
+func shellQuoteArg(arg string) string {
+	// Single quotes protect everything except single quotes themselves
+	// To include a single quote: end current quote, add escaped quote, restart quote
+	// Example: "it's" becomes 'it'\''s'
+	var result strings.Builder
+	result.WriteByte('\'')
+	for _, c := range arg {
+		if c == '\'' {
+			result.WriteString("'\\''")
+		} else {
+			result.WriteRune(c)
+		}
+	}
+	result.WriteByte('\'')
+	return result.String()
+}
+
 // shellQuoteArgs quotes arguments for shell.
 func shellQuoteArgs(args []string) string {
 	var quoted []string
 	for _, arg := range args {
-		// Simple quoting - wrap in single quotes, escape existing single quotes
-		escaped := ""
-		for _, c := range arg {
-			if c == '\'' {
-				escaped += `'\''`
-			} else {
-				escaped += string(c)
-			}
-		}
-		quoted = append(quoted, "'"+escaped+"'")
+		quoted = append(quoted, shellQuoteArg(arg))
 	}
-	return fmt.Sprintf("%s", joinStrings(quoted, " "))
+	return joinStrings(quoted, " ")
 }
 
 func joinStrings(strs []string, sep string) string {

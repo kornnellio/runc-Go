@@ -5,10 +5,63 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"runc-go/spec"
 )
+
+// allowedDevices is a whitelist of safe device major:minor numbers.
+// This prevents container specs from creating arbitrary devices like /dev/sda.
+var allowedDevices = map[string]bool{
+	// Standard character devices
+	"1:3":  true, // /dev/null
+	"1:5":  true, // /dev/zero
+	"1:7":  true, // /dev/full
+	"1:8":  true, // /dev/random
+	"1:9":  true, // /dev/urandom
+	"5:0":  true, // /dev/tty
+	"5:1":  true, // /dev/console
+	"5:2":  true, // /dev/ptmx
+	"1:11": true, // /dev/kmsg (read-only usually)
+	// PTY devices (136:* for pts)
+}
+
+// isPTYDevice checks if a device is a PTY (major 136 for unix98 PTYs).
+func isPTYDevice(major, minor int64) bool {
+	return major == 136 // unix98 PTY slaves
+}
+
+// isAllowedDevice checks if a device is in the whitelist.
+func isAllowedDevice(dev spec.LinuxDevice) bool {
+	key := fmt.Sprintf("%d:%d", dev.Major, dev.Minor)
+	if allowedDevices[key] {
+		return true
+	}
+	// Also allow PTY devices
+	if isPTYDevice(dev.Major, dev.Minor) {
+		return true
+	}
+	return false
+}
+
+// validateDevicePath ensures a device path is safe (within /dev).
+func validateDevicePath(path string) error {
+	// Clean the path
+	cleaned := filepath.Clean(path)
+
+	// Must start with /dev/
+	if !strings.HasPrefix(cleaned, "/dev/") && cleaned != "/dev" {
+		return fmt.Errorf("device path %q must be under /dev", path)
+	}
+
+	// No path traversal after /dev
+	if strings.Contains(cleaned[4:], "..") {
+		return fmt.Errorf("device path %q contains path traversal", path)
+	}
+
+	return nil
+}
 
 // DefaultDevices returns the standard set of devices for a container.
 func DefaultDevices() []spec.LinuxDevice {
@@ -26,9 +79,25 @@ func DefaultDevices() []spec.LinuxDevice {
 // CreateAllDevices creates all device nodes for the container.
 func CreateAllDevices(devices []spec.LinuxDevice, rootfs string) error {
 	for _, dev := range devices {
+		// Validate device path format
+		if err := validateDevicePath(dev.Path); err != nil {
+			return fmt.Errorf("invalid device path: %w", err)
+		}
+
+		// Check if device is in whitelist (skip for default devices)
+		if !isAllowedDevice(dev) {
+			return fmt.Errorf("device %s (major:minor %d:%d) is not in allowed list",
+				dev.Path, dev.Major, dev.Minor)
+		}
+
 		path := dev.Path
 		if rootfs != "" {
-			path = filepath.Join(rootfs, dev.Path)
+			// Use SecureJoin to prevent path traversal
+			var err error
+			path, err = SecureJoin(rootfs, dev.Path)
+			if err != nil {
+				return fmt.Errorf("invalid device path %q: %w", dev.Path, err)
+			}
 		}
 
 		if err := createDeviceNode(path, dev); err != nil {
@@ -96,10 +165,20 @@ func createDeviceNode(path string, dev spec.LinuxDevice) error {
 // This is useful when mknod is not available (e.g., rootless containers).
 func BindMountDevices(devices []spec.LinuxDevice, rootfs string) error {
 	for _, dev := range devices {
+		// Validate device path
+		if err := validateDevicePath(dev.Path); err != nil {
+			return fmt.Errorf("invalid device path: %w", err)
+		}
+
 		hostPath := dev.Path
 		containerPath := dev.Path
 		if rootfs != "" {
-			containerPath = filepath.Join(rootfs, dev.Path)
+			// Use SecureJoin to prevent path traversal
+			var err error
+			containerPath, err = SecureJoin(rootfs, dev.Path)
+			if err != nil {
+				return fmt.Errorf("invalid device path %q: %w", dev.Path, err)
+			}
 		}
 
 		// Check if host device exists

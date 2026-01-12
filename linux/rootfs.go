@@ -11,6 +11,37 @@ import (
 	"runc-go/spec"
 )
 
+// SecureJoin safely joins a base path with an untrusted path component,
+// ensuring the result is within the base path (prevents path traversal).
+func SecureJoin(base, unsafePath string) (string, error) {
+	// Clean the base path
+	base = filepath.Clean(base)
+	if base == "" {
+		return "", fmt.Errorf("base path cannot be empty")
+	}
+
+	// Handle absolute paths by stripping leading /
+	unsafePath = filepath.Clean("/" + unsafePath)
+
+	// Join and clean
+	joined := filepath.Join(base, unsafePath)
+	joined = filepath.Clean(joined)
+
+	// Verify the result is within base
+	// Add trailing slash to base for proper prefix matching
+	baseWithSlash := base
+	if !strings.HasSuffix(baseWithSlash, string(filepath.Separator)) {
+		baseWithSlash += string(filepath.Separator)
+	}
+
+	// The joined path must either equal base or start with base/
+	if joined != base && !strings.HasPrefix(joined, baseWithSlash) {
+		return "", fmt.Errorf("path %q escapes base %q", unsafePath, base)
+	}
+
+	return joined, nil
+}
+
 // Mount propagation flags
 const (
 	MS_PRIVATE     = syscall.MS_PRIVATE
@@ -177,7 +208,11 @@ func chrootFallback(rootfs string) error {
 // setupMounts performs all mounts specified in the OCI config.
 func setupMounts(mounts []spec.Mount, rootfs string) error {
 	for _, m := range mounts {
-		dest := filepath.Join(rootfs, m.Destination)
+		// Use SecureJoin to prevent path traversal attacks
+		dest, err := SecureJoin(rootfs, m.Destination)
+		if err != nil {
+			return fmt.Errorf("invalid mount destination %q: %w", m.Destination, err)
+		}
 
 		// Parse mount options
 		flags, data := parseMountOptions(m.Options)
@@ -189,7 +224,12 @@ func setupMounts(mounts []spec.Mount, rootfs string) error {
 		if isBind {
 			// Bind mount - check if source is file or directory
 			if !filepath.IsAbs(source) {
-				source = filepath.Join(rootfs, source)
+				// Relative source paths must also be validated
+				var err error
+				source, err = SecureJoin(rootfs, source)
+				if err != nil {
+					return fmt.Errorf("invalid bind source %q: %w", m.Source, err)
+				}
 			}
 
 			// Stat the source to determine if it's a file or directory

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -95,7 +94,8 @@ func main() {
 parseCommand:
 	// Setup logging if configured
 	if globalLog != "" {
-		f, err := os.OpenFile(globalLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		// Use restrictive permissions (0600) for log files to prevent information disclosure
+		f, err := os.OpenFile(globalLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err == nil {
 			logWriter = f
 			defer f.Close()
@@ -173,7 +173,7 @@ Options:
   --root <path>        State directory (default: /run/runc-go)
   --bundle <path>      Bundle directory (alternative to positional arg)
   --pid-file <path>    Write container PID to file
-  --console-socket     Socket for console (not implemented)
+  --console-socket     Unix socket to receive PTY master
   -f, --force          Force action (for delete)
   -t, --tty            Allocate a pseudo-TTY (for exec)
   --cwd <path>         Working directory inside container (for exec)
@@ -566,43 +566,5 @@ func (a *cliArgs) pos(i int) string {
 	}
 	return ""
 }
-
-// Helper for generating OCI bundle from container images
-// This is not part of the OCI runtime spec but useful for testing
-func cmdPrepare() error {
-	args := parseArgs(os.Args[2:])
-
-	rootfs := args.pos(0)
-	if rootfs == "" {
-		return fmt.Errorf("rootfs path required")
-	}
-
-	// Create rootfs directory structure
-	dirs := []string{
-		"bin", "sbin", "lib", "lib64",
-		"usr/bin", "usr/sbin", "usr/lib",
-		"etc", "var", "tmp", "root", "home",
-		"proc", "sys", "dev", "dev/pts", "dev/shm",
-	}
-
-	for _, dir := range dirs {
-		path := filepath.Join(rootfs, dir)
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", dir, err)
-		}
-	}
-
-	// Create minimal /etc files
-	etc := filepath.Join(rootfs, "etc")
-	os.WriteFile(filepath.Join(etc, "hostname"), []byte("container\n"), 0644)
-	os.WriteFile(filepath.Join(etc, "hosts"), []byte("127.0.0.1 localhost\n"), 0644)
-	os.WriteFile(filepath.Join(etc, "resolv.conf"), []byte("nameserver 8.8.8.8\n"), 0644)
-
-	fmt.Printf("Prepared rootfs at %s\n", rootfs)
-	fmt.Println("Copy binaries and libraries to complete the rootfs")
-
-	return nil
-}
-
 // Ignore unused syscall import warning
 var _ = syscall.SIGTERM

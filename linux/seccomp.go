@@ -203,8 +203,12 @@ func SetupSeccomp(config *spec.LinuxSeccomp) error {
 	// If more than 20% of syscalls are unrecognized, skip our incomplete filter
 	// This is a safety measure for Docker integration
 	if unrecognized > 0 && (recognized == 0 || float64(unrecognized)/float64(recognized+unrecognized) > 0.2) {
-		// Skip applying our incomplete filter
-		// Docker/containerd applies seccomp via containerd-shim anyway
+		// SECURITY WARNING: Notify user that seccomp filter is being skipped
+		fmt.Printf("[seccomp] WARNING: Skipping seccomp filter - %d of %d syscalls unrecognized (%.1f%%)\n",
+			unrecognized, recognized+unrecognized,
+			100*float64(unrecognized)/float64(recognized+unrecognized))
+		fmt.Printf("[seccomp] WARNING: Container may have unrestricted syscall access!\n")
+		fmt.Printf("[seccomp] WARNING: Use a runtime with full libseccomp support for production.\n")
 		return nil
 	}
 

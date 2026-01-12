@@ -5,9 +5,40 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 )
+
+// ValidateSocketPath checks that a socket path is safe.
+func ValidateSocketPath(path string) error {
+	if path == "" {
+		return fmt.Errorf("socket path cannot be empty")
+	}
+
+	// Get absolute path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("invalid socket path: %w", err)
+	}
+
+	// Check if path exists and is a socket
+	info, err := os.Stat(absPath)
+	if err != nil {
+		// Path doesn't exist yet - that's fine for sockets being created
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("cannot stat socket path: %w", err)
+	}
+
+	// If path exists, it must be a socket
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("path %q exists but is not a socket", path)
+	}
+
+	return nil
+}
 
 // Console represents a pseudoterminal pair.
 type Console struct {
@@ -127,6 +158,11 @@ func SetWinsize(f *os.File, ws *Winsize) error {
 // SendConsoleToSocket sends the console master FD over a unix socket.
 // This is used for the --console-socket option.
 func SendConsoleToSocket(socketPath string, master *os.File) error {
+	// Validate socket path before connecting
+	if err := ValidateSocketPath(socketPath); err != nil {
+		return fmt.Errorf("invalid console socket: %w", err)
+	}
+
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", socketPath, err)
@@ -193,5 +229,37 @@ func RestoreMode(f *os.File, state *syscall.Termios) error {
 	if errno != 0 {
 		return fmt.Errorf("TCSETS: %v", errno)
 	}
+	return nil
+}
+
+// SetupTerminalSignals ensures the terminal has ISIG enabled for signal generation
+// and sets the current process as the foreground process group.
+func SetupTerminalSignals(f *os.File) error {
+	// Get current terminal settings
+	var termios syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
+		f.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&termios)))
+	if errno != 0 {
+		return fmt.Errorf("TCGETS: %v", errno)
+	}
+
+	// Enable ISIG to generate signals from Ctrl+C, Ctrl+Z, etc.
+	termios.Lflag |= syscall.ISIG
+
+	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL,
+		f.Fd(), syscall.TCSETS, uintptr(unsafe.Pointer(&termios)))
+	if errno != 0 {
+		return fmt.Errorf("TCSETS: %v", errno)
+	}
+
+	// Set ourselves as the foreground process group
+	pgrp := syscall.Getpgrp()
+	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL,
+		f.Fd(), syscall.TIOCSPGRP, uintptr(unsafe.Pointer(&pgrp)))
+	if errno != 0 {
+		// Non-fatal - may fail if not session leader
+		return nil
+	}
+
 	return nil
 }

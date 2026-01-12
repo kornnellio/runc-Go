@@ -6,11 +6,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"time"
 
 	"runc-go/spec"
 )
+
+// containerIDRegex defines valid container ID format.
+// Must be alphanumeric with dashes/underscores, no path separators or special chars.
+var containerIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// ValidateContainerID checks that a container ID is safe and valid.
+func ValidateContainerID(id string) error {
+	if id == "" {
+		return fmt.Errorf("container ID cannot be empty")
+	}
+	if len(id) > 1024 {
+		return fmt.Errorf("container ID too long (max 1024 characters)")
+	}
+	if !containerIDRegex.MatchString(id) {
+		return fmt.Errorf("container ID %q contains invalid characters (must be alphanumeric with _.-)", id)
+	}
+	// Explicitly check for path traversal attempts
+	if id == "." || id == ".." || filepath.Clean(id) != id {
+		return fmt.Errorf("container ID %q contains path traversal", id)
+	}
+	return nil
+}
 
 const (
 	// DefaultStateDir is the default directory for container state.
@@ -49,6 +72,11 @@ type Container struct {
 
 // Load loads an existing container by ID.
 func Load(id string, stateRoot string) (*Container, error) {
+	// Validate container ID to prevent path traversal
+	if err := ValidateContainerID(id); err != nil {
+		return nil, err
+	}
+
 	if stateRoot == "" {
 		stateRoot = DefaultStateDir
 	}
@@ -69,15 +97,25 @@ func Load(id string, stateRoot string) (*Container, error) {
 		InitProcess: state.Pid,
 	}
 
-	// Load spec if available
+	// Load spec if available (non-fatal if missing)
 	specPath := filepath.Join(state.Bundle, "config.json")
-	c.Spec, _ = spec.LoadSpec(specPath)
+	loadedSpec, err := spec.LoadSpec(specPath)
+	if err != nil {
+		// Log warning but don't fail - spec may not be needed for all operations
+		fmt.Printf("[container] warning: could not load spec: %v\n", err)
+	}
+	c.Spec = loadedSpec
 
 	return c, nil
 }
 
 // New creates a new container instance (doesn't start it yet).
 func New(id, bundle, stateRoot string) (*Container, error) {
+	// Validate container ID to prevent path traversal
+	if err := ValidateContainerID(id); err != nil {
+		return nil, err
+	}
+
 	if stateRoot == "" {
 		stateRoot = DefaultStateDir
 	}

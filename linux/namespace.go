@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"runc-go/spec"
 )
 
@@ -89,15 +91,13 @@ func setns(path string, nsType spec.LinuxNamespaceType) error {
 	defer syscall.Close(fd)
 
 	flag := namespaceTypeToFlag[nsType]
-	_, _, errno := syscall.Syscall(SYS_SETNS, uintptr(fd), flag, 0)
+	// Use unix.SYS_SETNS which is architecture-independent
+	_, _, errno := syscall.Syscall(unix.SYS_SETNS, uintptr(fd), flag, 0)
 	if errno != 0 {
 		return errno
 	}
 	return nil
 }
-
-// SYS_SETNS is the setns syscall number for x86_64.
-const SYS_SETNS = 308
 
 // BuildSysProcAttr creates SysProcAttr from OCI spec.
 func BuildSysProcAttr(s *spec.Spec) (*syscall.SysProcAttr, error) {

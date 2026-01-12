@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"runc-go/linux"
 	"runc-go/spec"
+	"runc-go/utils"
 )
 
 // CreateOptions contains options for container creation.
@@ -88,14 +91,34 @@ func (c *Container) Create(opts *CreateOptions) error {
 	)
 
 	// Setup stdin/stdout/stderr
-	// For now, inherit from parent (todo: console socket)
-	if c.Spec.Process != nil && c.Spec.Process.Terminal {
-		// Terminal mode - we'd setup console socket here
-		// For now, just use parent's terminal
+	var console *utils.Console
+	var consoleSlave *os.File
+	if c.Spec.Process != nil && c.Spec.Process.Terminal && opts.ConsoleSocket != "" {
+		// Console socket mode: create PTY and send master to socket
+		var err error
+		console, err = utils.NewConsole()
+		if err != nil {
+			return fmt.Errorf("create console: %w", err)
+		}
+		// Open slave PTY in parent and pass to child via inheritance
+		consoleSlave, err = console.OpenSlave()
+		if err != nil {
+			console.Close()
+			return fmt.Errorf("open console slave: %w", err)
+		}
+		// Connect child's stdio to slave PTY
+		cmd.Stdin = consoleSlave
+		cmd.Stdout = consoleSlave
+		cmd.Stderr = consoleSlave
+		// Note: Don't set Setctty here - it interferes with namespace creation
+		// The controlling terminal is set up in InitContainer instead
+	} else if c.Spec.Process != nil && c.Spec.Process.Terminal {
+		// Direct terminal mode: inherit from parent
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 	} else {
+		// Non-terminal mode
 		cmd.Stdin = nil
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -103,7 +126,26 @@ func (c *Container) Create(opts *CreateOptions) error {
 
 	// Start the init process
 	if err := cmd.Start(); err != nil {
+		if console != nil {
+			console.Close()
+		}
 		return fmt.Errorf("start init: %w", err)
+	}
+
+	// Send PTY master to console socket (must be after cmd.Start)
+	if console != nil {
+		if err := utils.SendConsoleToSocket(opts.ConsoleSocket, console.Master()); err != nil {
+			cmd.Process.Kill()
+			console.Close()
+			if consoleSlave != nil {
+				consoleSlave.Close()
+			}
+			return fmt.Errorf("send console to socket: %w", err)
+		}
+		console.Close() // Parent doesn't need master anymore
+		if consoleSlave != nil {
+			consoleSlave.Close() // Parent doesn't need slave anymore
+		}
 	}
 
 	c.InitProcess = cmd.Process.Pid
@@ -219,6 +261,16 @@ func InitContainer() error {
 		return fmt.Errorf("read fifo: %w", err)
 	}
 
+	// Create /dev/console if stdin is a PTY (character device)
+	// Go's Setctty flag handles setsid() and TIOCSCTTY automatically
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(0, &stat); err == nil {
+		if stat.Mode&syscall.S_IFCHR != 0 {
+			os.Remove("/dev/console")
+			syscall.Mknod("/dev/console", syscall.S_IFCHR|0600, int(stat.Rdev))
+		}
+	}
+
 	// Apply capabilities
 	if s.Process != nil && s.Process.Capabilities != nil {
 		if err := linux.ApplyCapabilities(s.Process.Capabilities); err != nil {
@@ -255,14 +307,55 @@ func InitContainer() error {
 		return fmt.Errorf("no process args specified")
 	}
 
+	// If stdin is a TTY, ensure it's the controlling terminal
+	// This is needed because Go's Setctty doesn't work reliably with Cloneflags
+	if s.Process.Terminal {
+		// Try to become session leader (may already be one, which is fine)
+		syscall.Setsid()
+		// Set stdin as controlling terminal
+		utils.SetControllingTerminal(os.Stdin)
+		// Enable signal generation and set foreground process group
+		utils.SetupTerminalSignals(os.Stdin)
+	}
+
 	args := s.Process.Args
 	path, err := exec.LookPath(args[0])
 	if err != nil {
 		return fmt.Errorf("lookup %s: %w", args[0], err)
 	}
 
-	// Exec replaces this process with the user's command
-	return execProcess(path, args, os.Environ())
+	// Instead of exec'ing directly (which would make user command PID 1),
+	// fork/exec and forward signals. PID 1 in Linux ignores signals without handlers.
+	cmd := exec.Command(path, args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+
+	// Start the user process
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start user process: %w", err)
+	}
+
+	// Forward signals to the child process
+	// PID 1 in Linux ignores signals without handlers, so we must catch and forward them
+	sigChan := make(chan os.Signal, 10)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	go func() {
+		for sig := range sigChan {
+			cmd.Process.Signal(sig)
+		}
+	}()
+
+	// Wait for child to exit and propagate its exit code
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
+	os.Exit(0)
+	return nil // unreachable
 }
 
 // splitEnv splits an environment variable string into key and value.

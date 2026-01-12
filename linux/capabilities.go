@@ -3,7 +3,10 @@ package linux
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -53,8 +56,40 @@ const (
 	CAP_PERFMON            = 38
 	CAP_BPF                = 39
 	CAP_CHECKPOINT_RESTORE = 40
-	CAP_LAST_CAP           = 40
 )
+
+var (
+	// lastCapOnce ensures we only detect the last capability once
+	lastCapOnce sync.Once
+	// lastCapValue holds the detected last capability value
+	lastCapValue int = 40 // default fallback
+)
+
+// getLastCap returns the highest capability supported by the kernel.
+// This is detected dynamically to support newer kernels with more capabilities.
+func getLastCap() int {
+	lastCapOnce.Do(func() {
+		// Try to read from /proc/sys/kernel/cap_last_cap first (most reliable)
+		if data, err := os.ReadFile("/proc/sys/kernel/cap_last_cap"); err == nil {
+			if val, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && val >= 0 {
+				lastCapValue = val
+				return
+			}
+		}
+
+		// Fallback: probe using prctl
+		// Start from known CAP_CHECKPOINT_RESTORE and probe higher
+		for cap := 40; cap <= 63; cap++ {
+			ret, _, _ := syscall.Syscall(syscall.SYS_PRCTL, PR_CAPBSET_READ, uintptr(cap), 0)
+			if ret == ^uintptr(0) { // -1 means EINVAL, cap doesn't exist
+				lastCapValue = cap - 1
+				return
+			}
+		}
+		lastCapValue = 63 // maximum possible
+	})
+	return lastCapValue
+}
 
 // capabilityMap maps capability names to numbers.
 var capabilityMap = map[string]int{
@@ -175,13 +210,20 @@ func applyBounding(bounding []string) error {
 	// Build set of allowed capabilities
 	allowed := make(map[int]bool)
 	for _, name := range bounding {
-		if cap, ok := capabilityMap[strings.ToUpper(name)]; ok {
+		capName := strings.ToUpper(name)
+		if cap, ok := capabilityMap[capName]; ok {
 			allowed[cap] = true
+		} else {
+			// Warn about unknown capability instead of silently ignoring
+			fmt.Printf("[capabilities] warning: unknown capability %q\n", name)
 		}
 	}
 
+	// Use dynamic last capability detection
+	lastCap := getLastCap()
+
 	// Drop all capabilities not in allowed set
-	for cap := 0; cap <= CAP_LAST_CAP; cap++ {
+	for cap := 0; cap <= lastCap; cap++ {
 		if !allowed[cap] {
 			// Check if in bounding set first
 			ret, _, _ := syscall.Syscall(syscall.SYS_PRCTL, PR_CAPBSET_READ, uintptr(cap), 0)

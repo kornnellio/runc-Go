@@ -4,6 +4,8 @@ import (
 	"syscall"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"runc-go/spec"
 )
 
@@ -296,9 +298,10 @@ func TestBuildSysProcAttrWithUserNamespace(t *testing.T) {
 }
 
 func TestSYS_SETNS(t *testing.T) {
-	// Verify the syscall number for x86_64
-	if SYS_SETNS != 308 {
-		t.Errorf("SYS_SETNS should be 308 for x86_64, got %d", SYS_SETNS)
+	// Verify that unix.SYS_SETNS is available (architecture-independent)
+	// The actual value varies by architecture (308 for x86_64, 268 for ARM64)
+	if unix.SYS_SETNS <= 0 {
+		t.Errorf("unix.SYS_SETNS should be a positive syscall number, got %d", unix.SYS_SETNS)
 	}
 }
 

@@ -1,1189 +1,240 @@
 # runc-go
 
-An OCI-compliant container runtime written in Go for educational purposes.
-
----
-
-## Table of Contents
-
-1. [What is This?](#what-is-this)
-2. [Prerequisites](#prerequisites)
-3. [Building](#building)
-4. [Quick Start](#quick-start)
-5. [Commands Reference](#commands-reference)
-6. [Understanding OCI Containers](#understanding-oci-containers)
-7. [Creating a Container Bundle](#creating-a-container-bundle)
-8. [The config.json File](#the-configjson-file)
-9. [Container Lifecycle](#container-lifecycle)
-10. [Using with Docker](#using-with-docker)
-11. [Troubleshooting](#troubleshooting)
-12. [Project Structure](#project-structure)
-13. [How It Works](#how-it-works)
-14. [Differences from Production runc](#differences-from-production-runc)
-15. [Changelog](#changelog)
-
----
+An educational OCI-compliant container runtime written in Go.
 
 ## What is This?
 
-`runc-go` is a **container runtime** that implements the [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec).
+`runc-go` is a container runtime that implements the [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec). It's designed to teach how containers actually work under the hood.
 
-### In Simple Terms:
+**Think of it this way:**
+- Docker is the car dealership (finds and manages containers)
+- `runc-go` is the engine (actually runs them)
 
-- **Docker** is like a car dealership - it helps you find, buy, and manage cars
-- **runc-go** is like the engine - it's what actually makes the car run
+When you run `docker run alpine`, Docker downloads the image, unpacks it, creates a config, then calls a runtime like `runc-go` to actually run the container.
 
-When you run `docker run alpine`, Docker:
-1. Downloads the Alpine image
-2. Unpacks it to a directory
-3. Creates a `config.json` with settings
-4. Calls a **runtime** (like `runc` or `runc-go`) to actually run the container
+## Features
 
-This project IS that runtime. It takes a directory with files and a config, and runs it as an isolated container.
-
----
-
-## Prerequisites
-
-### Required
-
-| Requirement | Why |
-|-------------|-----|
-| **Linux** | Containers use Linux-specific features (namespaces, cgroups) |
-| **Go 1.21+** | To compile the source code |
-| **Root access (sudo)** | Container isolation requires root privileges |
-
-### Optional
-
-| Tool | Why |
-|------|-----|
-| **Docker** | Easiest way to create container filesystems |
-
-### Check Your System
-
-```bash
-# Check Linux
-uname -s
-# Should output: Linux
-
-# Check Go
-go version
-# Should output: go version go1.21+ ...
-
-# Check sudo
-sudo whoami
-# Should output: root
-```
-
----
-
-## Building
-
-### Using Make (Recommended)
-
-```bash
-# Build the binary
-make build
-
-# Verify the build
-./runc-go version
-
-# Install system-wide
-make install
-```
-
-### Manual Build
-
-```bash
-go build -o runc-go .
-./runc-go version
-```
-
-**Expected output:**
-```
-runc-go version 0.1.0
-spec: 1.0.2
-```
-
-### Available Make Targets
-
-| Target | Description |
-|--------|-------------|
-| `make build` | Build optimized binary |
-| `make test` | Run all tests |
-| `make test-coverage` | Generate coverage report |
-| `make lint` | Run golangci-lint |
-| `make install` | Install to /usr/local/bin |
-| `make clean` | Remove build artifacts |
-| `make help` | Show all targets |
-
----
+- Full OCI runtime specification compliance
+- Works as a Docker runtime
+- Linux namespace isolation (PID, mount, UTS, IPC, network, cgroup)
+- Cgroups v2 resource limits (memory, CPU, PIDs)
+- Interactive shell support with PTY
+- Exec into running containers
+- Signal forwarding (Ctrl+C works!)
+- Security hardening (path validation, input sanitization)
 
 ## Quick Start
 
-This section gets you running a container in under 2 minutes.
-
-### Step 1: Create a Test Directory
+### Build & Install
 
 ```bash
-mkdir -p /tmp/my-container/rootfs
-cd /tmp/my-container
+make build
+sudo cp runc-go /usr/local/bin/
 ```
 
-### Step 2: Get a Filesystem (Using Docker)
+### Use with Docker
 
 ```bash
-# Pull Alpine Linux (tiny Linux distro, ~5MB)
-docker pull alpine:latest
+# Configure Docker (one-time)
+sudo tee /etc/docker/daemon.json << 'EOF'
+{
+  "runtimes": {
+    "runc-go": {
+      "path": "/usr/local/bin/runc-go"
+    }
+  }
+}
+EOF
+sudo systemctl restart docker
 
-# Export it to our rootfs directory
-docker export $(docker create alpine:latest) | tar -xf - -C rootfs
+# Run containers
+sudo docker run --runtime=runc-go --rm alpine echo "Hello!"
+sudo docker run --runtime=runc-go --rm -it alpine
 ```
 
-**What just happened?**
-- Docker downloaded Alpine Linux
-- We extracted all its files to `rootfs/`
-- This directory now contains a complete Linux filesystem
-
-### Step 3: Generate a Config File
+### Use Standalone
 
 ```bash
-/home/me/Desktop/Go_Linux/runc-go/runc-go spec > config.json
+# Create a bundle
+mkdir -p /tmp/bundle/rootfs
+docker export $(docker create alpine) | tar -xf - -C /tmp/bundle/rootfs
+runc-go spec > /tmp/bundle/config.json
+
+# Run it
+sudo runc-go run mycontainer /tmp/bundle
 ```
 
-### Step 4: Run the Container
-
-```bash
-sudo /home/me/Desktop/Go_Linux/runc-go/runc-go run my-first-container .
-```
-
-**You should see a shell prompt inside the container!**
-
-```
-/ #
-```
-
-### Step 5: Explore Inside the Container
-
-```bash
-# Check the hostname
-hostname
-
-# Check the process list (only shows container processes)
-ps aux
-
-# Check the filesystem
-ls /
-
-# Exit the container
-exit
-```
-
----
-
-## Commands Reference
-
-### Overview
+## Commands
 
 | Command | Description |
 |---------|-------------|
-| `create` | Create a container (but don't start it) |
+| `run` | Create and start a container |
+| `create` | Create a container (paused) |
 | `start` | Start a created container |
-| `run` | Create and start in one step |
-| `exec` | Execute a command in a running container |
-| `state` | Show container status as JSON |
+| `exec` | Run a command in a running container |
+| `state` | Show container state as JSON |
 | `list` | List all containers |
-| `kill` | Send a signal to a container |
+| `kill` | Send signal to container |
 | `delete` | Remove a container |
-| `spec` | Generate a default config.json |
+| `spec` | Generate default config.json |
 
-### Detailed Usage
-
-#### `runc-go create`
-
-Creates a container but does NOT start the main process. The container waits until you call `start`.
+### Examples
 
 ```bash
-sudo runc-go create <container-id> <bundle-path>
-```
+# Run interactive shell
+sudo runc-go run -t myapp /tmp/bundle
 
-**Example:**
-```bash
-sudo runc-go create myapp /tmp/my-container
-```
-
-**Options:**
-- `--pid-file <path>` - Write the container PID to a file
-- `--root <path>` - Use a different state directory (default: `/run/runc-go`)
-
----
-
-#### `runc-go start`
-
-Starts a container that was previously created.
-
-```bash
-sudo runc-go start <container-id>
-```
-
-**Example:**
-```bash
+# Two-step create/start
+sudo runc-go create myapp /tmp/bundle
 sudo runc-go start myapp
-```
 
----
-
-#### `runc-go run`
-
-Creates AND starts a container in one command. This is what you'll use most often.
-
-```bash
-sudo runc-go run <container-id> <bundle-path>
-```
-
-**Example:**
-```bash
-sudo runc-go run myapp /tmp/my-container
-```
-
----
-
-#### `runc-go exec`
-
-Executes a new command inside a running container. Supports interactive shells with TTY.
-
-```bash
-sudo runc-go exec [options] <container-id> <command> [args...]
-```
-
-**Options:**
-- `-t, --tty` - Allocate a pseudo-TTY for interactive use
-- `--cwd <path>` - Set working directory inside container
-- `--env <VAR=value>` - Add environment variable
-- `-d, --detach` - Run in background
-- `--pid-file <path>` - Write process PID to file
-- `--process <file>` - Use JSON process spec file (Docker/containerd style)
-
-**Examples:**
-```bash
-# Run a simple command
-sudo runc-go exec myapp /bin/ls
-
-# Interactive shell with TTY
+# Exec into running container
 sudo runc-go exec -t myapp /bin/sh
 
-# Run with custom working directory
-sudo runc-go exec --cwd /app myapp ./start.sh
-
-# Run with environment variable
-sudo runc-go exec --env DEBUG=1 myapp /bin/app
-
-# Run in background
-sudo runc-go exec -d myapp /bin/long-running-task
-```
-
-**With Docker:**
-```bash
-# Start a container with runc-go
-docker run -d --name mycontainer --runtime=runc-go alpine sleep 300
-
-# Execute commands in it
-docker exec mycontainer echo "Hello"
-docker exec -it mycontainer /bin/sh
-```
-
----
-
-#### `runc-go state`
-
-Shows the current state of a container as JSON.
-
-```bash
-sudo runc-go state <container-id>
-```
-
-**Example output:**
-```json
-{
-  "ociVersion": "1.0.2",
-  "id": "myapp",
-  "status": "running",
-  "pid": 12345,
-  "bundle": "/tmp/my-container"
-}
-```
-
-**Possible statuses:**
-- `creating` - Container is being set up
-- `created` - Container exists but process hasn't started
-- `running` - Container process is running
-- `stopped` - Container process has exited
-
----
-
-#### `runc-go list`
-
-Lists all containers.
-
-```bash
-sudo runc-go list
-```
-
-**Example output:**
-```
-ID        PID    STATUS   BUNDLE              CREATED
-myapp     12345  running  /tmp/my-container   2024-01-15 10:30:00
-webapp    12400  stopped  /tmp/webapp         2024-01-15 09:15:00
-```
-
----
-
-#### `runc-go kill`
-
-Sends a signal to the container's main process.
-
-```bash
-sudo runc-go kill <container-id> [signal]
-```
-
-**Examples:**
-```bash
-# Graceful shutdown (SIGTERM)
+# Stop and remove
 sudo runc-go kill myapp SIGTERM
-
-# Force kill (SIGKILL)
-sudo runc-go kill myapp SIGKILL
-
-# Using signal numbers
-sudo runc-go kill myapp 9
-```
-
-**Common signals:**
-| Signal | Number | Effect |
-|--------|--------|--------|
-| SIGTERM | 15 | Graceful shutdown (process can cleanup) |
-| SIGKILL | 9 | Immediate termination (cannot be caught) |
-| SIGHUP | 1 | Hangup (often used to reload config) |
-
----
-
-#### `runc-go delete`
-
-Removes a container. The container must be stopped first (unless you use `--force`).
-
-```bash
-sudo runc-go delete <container-id>
-```
-
-**Options:**
-- `--force` or `-f` - Kill the container if it's still running
-
-**Examples:**
-```bash
-# Delete a stopped container
 sudo runc-go delete myapp
-
-# Force delete a running container
-sudo runc-go delete myapp --force
 ```
 
----
+## How Containers Work
 
-#### `runc-go spec`
-
-Generates a default `config.json` file.
-
-```bash
-runc-go spec > config.json
-```
-
-**Options:**
-- `--rootless` - Generate config for rootless (unprivileged) containers
-
----
-
-## Understanding OCI Containers
-
-### What is OCI?
-
-OCI stands for **Open Container Initiative**. It's a standard that defines:
-
-1. **How container images are formatted** (layers, manifests)
-2. **How containers are run** (this is what runc-go implements)
-
-### What is a Container?
-
-A container is just a **regular Linux process** with extra isolation:
-
-| Isolation | What It Does |
-|-----------|--------------|
-| **PID Namespace** | Container sees itself as PID 1, can't see host processes |
-| **Mount Namespace** | Container has its own filesystem view |
-| **Network Namespace** | Container has its own network stack |
-| **UTS Namespace** | Container has its own hostname |
-| **IPC Namespace** | Container has its own shared memory |
-| **User Namespace** | Container can have its own user IDs (rootless) |
-| **Cgroups** | Limits CPU, memory, and other resources |
-
-### Visual Representation
+A container is just a Linux process with extra isolation:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         HOST SYSTEM                          │
-│                                                              │
-│  ┌─────────────────────┐    ┌─────────────────────┐         │
-│  │     Container A     │    │     Container B     │         │
-│  │  ┌───────────────┐  │    │  ┌───────────────┐  │         │
-│  │  │ PID 1 (bash)  │  │    │  │ PID 1 (nginx) │  │         │
-│  │  │ PID 2 (app)   │  │    │  │ PID 2 (worker)│  │         │
-│  │  └───────────────┘  │    │  └───────────────┘  │         │
-│  │  Hostname: app-srv  │    │  Hostname: web-srv  │         │
-│  │  IP: 10.0.0.2       │    │  IP: 10.0.0.3       │         │
-│  │  Rootfs: /tmp/appA  │    │  Rootfs: /tmp/appB  │         │
-│  └─────────────────────┘    └─────────────────────┘         │
-│                                                              │
-│  Host sees: PID 5001 (container A), PID 5050 (container B)  │
-└─────────────────────────────────────────────────────────────┘
++------------------------------------------+
+|              HOST SYSTEM                 |
+|                                          |
+|  +----------------+  +----------------+  |
+|  |  Container A   |  |  Container B   |  |
+|  |  PID 1: /bin/sh|  |  PID 1: nginx  |  |
+|  |  hostname: app |  |  hostname: web |  |
+|  |  rootfs: /tmp/a|  |  rootfs: /tmp/b|  |
+|  +----------------+  +----------------+  |
+|                                          |
+|  Host sees these as PID 5001 and 5050    |
++------------------------------------------+
 ```
 
----
-
-## Creating a Container Bundle
-
-A **bundle** is a directory containing everything needed to run a container:
-
-```
-my-container/           <-- Bundle directory
-├── config.json         <-- OCI configuration file
-└── rootfs/             <-- Root filesystem
-    ├── bin/
-    ├── etc/
-    ├── lib/
-    ├── usr/
-    └── ...
-```
-
-### Method 1: From Docker Image (Recommended)
-
-```bash
-# Create bundle directory
-mkdir -p my-container/rootfs
-cd my-container
-
-# Export any Docker image
-docker export $(docker create nginx:alpine) | tar -xf - -C rootfs
-
-# Generate config
-runc-go spec > config.json
-```
-
-### Method 2: From Scratch (Advanced)
-
-```bash
-mkdir -p my-container/rootfs
-cd my-container
-
-# Create minimal filesystem
-mkdir -p rootfs/{bin,lib,lib64,etc,proc,sys,dev}
-
-# Copy a static binary (busybox has everything)
-cp /path/to/busybox-static rootfs/bin/sh
-
-# Generate config
-runc-go spec > config.json
-```
-
-### Method 3: From Alpine Mini Root Filesystem
-
-```bash
-mkdir -p my-container/rootfs
-cd my-container
-
-# Download Alpine mini root filesystem
-wget https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.0-x86_64.tar.gz
-
-# Extract it
-tar -xzf alpine-minirootfs-3.19.0-x86_64.tar.gz -C rootfs
-
-# Generate config
-runc-go spec > config.json
-```
-
----
-
-## The config.json File
-
-The `config.json` file tells the runtime how to run your container. Here's a complete example with explanations:
-
-```json
-{
-  "ociVersion": "1.0.2",
-
-  "process": {
-    "terminal": true,
-    "user": {
-      "uid": 0,
-      "gid": 0
-    },
-    "args": [
-      "/bin/sh"
-    ],
-    "env": [
-      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-      "TERM=xterm",
-      "HOME=/root"
-    ],
-    "cwd": "/",
-    "noNewPrivileges": true
-  },
-
-  "root": {
-    "path": "rootfs",
-    "readonly": false
-  },
-
-  "hostname": "my-container",
-
-  "mounts": [
-    {
-      "destination": "/proc",
-      "type": "proc",
-      "source": "proc"
-    },
-    {
-      "destination": "/dev",
-      "type": "tmpfs",
-      "source": "tmpfs",
-      "options": ["nosuid", "mode=755"]
-    },
-    {
-      "destination": "/sys",
-      "type": "sysfs",
-      "source": "sysfs",
-      "options": ["nosuid", "noexec", "nodev", "ro"]
-    }
-  ],
-
-  "linux": {
-    "namespaces": [
-      { "type": "pid" },
-      { "type": "mount" },
-      { "type": "uts" },
-      { "type": "ipc" },
-      { "type": "network" }
-    ],
-    "resources": {
-      "memory": {
-        "limit": 536870912
-      },
-      "cpu": {
-        "quota": 50000,
-        "period": 100000
-      },
-      "pids": {
-        "limit": 100
-      }
-    }
-  }
-}
-```
-
-### Key Sections Explained
-
-#### `process` - What to Run
-
-| Field | Description | Example |
-|-------|-------------|---------|
-| `terminal` | Attach a terminal (for interactive use) | `true` |
-| `user.uid` | User ID inside container | `0` (root) |
-| `user.gid` | Group ID inside container | `0` (root) |
-| `args` | Command to run | `["/bin/sh", "-c", "echo hello"]` |
-| `env` | Environment variables | `["PATH=/bin", "HOME=/root"]` |
-| `cwd` | Working directory | `"/"` |
-
-#### `root` - Filesystem
-
-| Field | Description | Example |
-|-------|-------------|---------|
-| `path` | Path to rootfs (relative to bundle) | `"rootfs"` |
-| `readonly` | Mount rootfs as read-only | `false` |
-
-#### `linux.namespaces` - Isolation
-
-| Namespace | What It Isolates |
-|-----------|------------------|
-| `pid` | Process IDs |
-| `mount` | Filesystem mounts |
-| `uts` | Hostname |
-| `ipc` | Inter-process communication |
-| `network` | Network interfaces |
-| `user` | User/group IDs (for rootless) |
-
-#### `linux.resources` - Limits
-
-| Resource | What It Limits | Example |
-|----------|----------------|---------|
-| `memory.limit` | RAM in bytes | `536870912` (512MB) |
-| `cpu.quota/period` | CPU time (quota/period = fraction) | `50000/100000` = 50% |
-| `pids.limit` | Maximum processes | `100` |
-
----
-
-## Container Lifecycle
-
-### State Diagram
-
-```
-                    ┌──────────────┐
-                    │   (empty)    │
-                    └──────┬───────┘
-                           │ create
-                           ▼
-                    ┌──────────────┐
-                    │   created    │ ◄─── Container exists, process waiting
-                    └──────┬───────┘
-                           │ start
-                           ▼
-                    ┌──────────────┐
-                    │   running    │ ◄─── Process is executing
-                    └──────┬───────┘
-                           │ (process exits or kill)
-                           ▼
-                    ┌──────────────┐
-                    │   stopped    │ ◄─── Process has exited
-                    └──────┬───────┘
-                           │ delete
-                           ▼
-                    ┌──────────────┐
-                    │   (empty)    │
-                    └──────────────┘
-```
-
-### Example Workflow
-
-```bash
-# 1. Create container (stays in "created" state)
-sudo runc-go create myapp /tmp/my-container
-sudo runc-go state myapp  # status: "created"
-
-# 2. Start container (moves to "running" state)
-sudo runc-go start myapp
-sudo runc-go state myapp  # status: "running"
-
-# 3. Container runs... then exits (moves to "stopped" state)
-sudo runc-go state myapp  # status: "stopped"
-
-# 4. Delete container (removes all state)
-sudo runc-go delete myapp
-sudo runc-go state myapp  # error: container not found
-```
-
-### Why Separate Create and Start?
-
-The two-step process allows:
-
-1. **Hooks** - Run scripts between create and start
-2. **Network setup** - Configure networking before process runs
-3. **Inspection** - Check container setup before committing
-4. **Orchestration** - Kubernetes/Docker control when containers start
-
-For simple use cases, just use `run` which does both steps.
-
----
-
-## Using with Docker
-
-You can configure Docker to use `runc-go` as an alternative runtime. **This has been tested and works!**
-
-### Step 1: Configure Docker
-
-Edit or create `/etc/docker/daemon.json`:
-
-```json
-{
-  "runtimes": {
-    "runc-go": {
-      "path": "/full/path/to/runc-go"
-    }
-  }
-}
-```
-
-> **Note:** Use the full absolute path to the `runc-go` binary.
-
-### Step 2: Restart Docker
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-```
-
-### Step 3: Verify Registration
-
-```bash
-docker info | grep -A5 Runtimes
-# Should show: Runtimes: io.containerd.runc.v2 runc runc-go
-```
-
-### Step 4: Run Containers
-
-```bash
-# Basic test
-docker run --rm --runtime=runc-go alpine echo "Hello from runc-go!"
-
-# With environment variables
-docker run --rm --runtime=runc-go -e MY_VAR="test" alpine sh -c 'echo $MY_VAR'
-
-# With volume mounts
-docker run --rm --runtime=runc-go -v /tmp:/mnt alpine ls /mnt
-
-# Multi-command test
-docker run --rm --runtime=runc-go alpine sh -c "hostname && whoami && uname -a"
-```
-
-### Expected Output
-
-You'll see some warnings followed by your command output:
-
-```
-[rootfs] warning: mount .../sys/fs/cgroup (cgroup): operation not permitted
-[rootfs] warning: mask /proc/kcore: no such file or directory
-Hello from runc-go!
-```
-
-**These warnings are non-fatal** - they occur because:
-- `cgroup` mount requires special privileges that containerd already handles
-- Some `/proc` paths don't exist in all kernel configurations
-
-The container runs correctly despite these warnings.
-
-### What Works with Docker
-
-| Feature | Status |
-|---------|--------|
-| Basic containers | ✅ Works |
-| Environment variables | ✅ Works |
-| Volume mounts | ✅ Works |
-| Custom hostname | ✅ Works |
-| User specification | ✅ Works |
-| Working directory | ✅ Works |
-| Resource limits | ✅ Works |
-| Network (bridge) | ✅ Works (Docker handles networking) |
-| `docker exec` | ✅ Works |
-| Interactive TTY (`-it`) | ✅ Works |
-
-### Step 5: Make it Default (Optional)
-
-```json
-{
-  "default-runtime": "runc-go",
-  "runtimes": {
-    "runc-go": {
-      "path": "/full/path/to/runc-go"
-    }
-  }
-}
-```
-
-> **Warning:** Only set as default after thorough testing!
-
----
-
-## Troubleshooting
-
-### Common Errors and Solutions
-
-#### "permission denied"
-
-**Problem:** You're not running as root.
-
-**Solution:**
-```bash
-sudo runc-go run myapp /tmp/my-container
-```
-
-#### "container already exists"
-
-**Problem:** A container with this ID already exists.
-
-**Solution:**
-```bash
-# Delete the old container
-sudo runc-go delete myapp --force
-
-# Then create the new one
-sudo runc-go run myapp /tmp/my-container
-```
-
-#### "no such file or directory: config.json"
-
-**Problem:** The bundle directory doesn't have a config.json.
-
-**Solution:**
-```bash
-cd /path/to/bundle
-runc-go spec > config.json
-```
-
-#### "no such file or directory: rootfs"
-
-**Problem:** The rootfs directory doesn't exist or is empty.
-
-**Solution:**
-```bash
-mkdir -p /path/to/bundle/rootfs
-docker export $(docker create alpine) | tar -xf - -C /path/to/bundle/rootfs
-```
-
-#### "executable file not found"
-
-**Problem:** The command in config.json doesn't exist in the rootfs.
-
-**Solution:**
-Check that the binary exists:
-```bash
-ls /path/to/bundle/rootfs/bin/sh
-```
-
-#### "operation not permitted" during pivot_root
-
-**Problem:** Usually a namespace or mount issue.
-
-**Solution:**
-Make sure you're running as root and the system supports namespaces:
-```bash
-# Check namespace support
-ls /proc/self/ns/
-
-# Should show: cgroup, ipc, mnt, net, pid, user, uts
-```
-
-### Debugging Tips
-
-#### Check Container Logs
-
-The container's stdout/stderr go to your terminal. For background containers:
-```bash
-sudo runc-go run myapp /tmp/bundle > /tmp/container.log 2>&1 &
-cat /tmp/container.log
-```
-
-#### Check Container State
-
-```bash
-sudo runc-go state myapp
-```
-
-#### Check if Process is Running
-
-```bash
-# Get PID from state
-sudo runc-go state myapp | grep pid
-
-# Check process
-ps aux | grep <pid>
-```
-
-#### Check Cgroup
-
-```bash
-ls /sys/fs/cgroup/runc-go/myapp/
-cat /sys/fs/cgroup/runc-go/myapp/cgroup.procs
-```
-
----
+**Isolation mechanisms:**
+
+| Feature | What It Does |
+|---------|--------------|
+| PID Namespace | Container sees itself as PID 1 |
+| Mount Namespace | Container has its own filesystem |
+| Network Namespace | Container has its own network stack |
+| UTS Namespace | Container has its own hostname |
+| Cgroups | Limits CPU, memory, PIDs |
+| Capabilities | Restricts root powers |
+| Seccomp | Filters syscalls |
 
 ## Project Structure
 
 ```
 runc-go/
-├── main.go                    # CLI entry point and command routing
-├── go.mod                     # Go module definition
-├── Makefile                   # Build, test, and install targets
-├── README.md                  # This file
-│
-├── spec/                      # OCI Specification types
-│   ├── spec.go                # config.json schema (all struct definitions)
-│   ├── spec_test.go           # Tests for spec types
-│   ├── state.go               # Container state types
-│   └── state_test.go          # Tests for state management
-│
-├── container/                 # Container lifecycle management
-│   ├── container.go           # Container struct and state management
-│   ├── container_test.go      # Tests for container operations
-│   ├── create.go              # Create operation (fork, setup, wait)
-│   ├── start.go               # Start operation (signal init to exec)
-│   ├── exec.go                # Exec operation (run commands in containers)
-│   ├── state.go               # State query operation
-│   ├── kill.go                # Signal handling
-│   ├── delete.go              # Cleanup and removal
-│   └── syscalls.go            # Low-level syscall wrappers
-│
-├── linux/                     # Linux-specific isolation primitives
-│   ├── namespace.go           # Namespace creation and joining
-│   ├── namespace_test.go      # Tests for namespace configuration
-│   ├── cgroup.go              # Cgroup v2 resource limits
-│   ├── cgroup_test.go         # Tests for cgroup management
-│   ├── rootfs.go              # Filesystem setup (pivot_root, mounts)
-│   ├── capabilities.go        # Linux capabilities management
-│   ├── seccomp.go             # Seccomp BPF syscall filtering
-│   └── devices.go             # Device node creation
-│
-├── hooks/                     # OCI lifecycle hooks
-│   └── hooks.go               # Hook execution (prestart, poststart, etc.)
-│
-└── utils/                     # Utility functions
-    ├── sync.go                # Parent-child synchronization (FIFO, pipes)
-    └── console.go             # PTY/terminal handling
+├── main.go              # CLI entry point
+├── container/           # Container lifecycle
+│   ├── container.go     # State management
+│   ├── create.go        # Create operation
+│   ├── start.go         # Start operation
+│   ├── exec.go          # Exec into containers
+│   ├── kill.go          # Signal handling
+│   └── delete.go        # Cleanup
+├── linux/               # Linux primitives
+│   ├── namespace.go     # Namespace setup
+│   ├── cgroup.go        # Resource limits
+│   ├── rootfs.go        # Filesystem isolation
+│   ├── capabilities.go  # Capability management
+│   ├── seccomp.go       # Syscall filtering
+│   └── devices.go       # Device nodes
+├── spec/                # OCI spec types
+│   ├── spec.go          # config.json schema
+│   └── state.go         # Container state
+├── utils/               # Utilities
+│   ├── sync.go          # Process synchronization
+│   └── console.go       # PTY handling
+└── hooks/               # Lifecycle hooks
+    └── hooks.go
 ```
 
-### File Descriptions
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `main.go` | ~600 | CLI parsing, command dispatch |
-| `spec/spec.go` | ~600 | Complete OCI config.json schema |
-| `spec/state.go` | ~80 | Container state structures |
-| `container/container.go` | ~200 | Container management, state persistence |
-| `container/create.go` | ~300 | The create operation - forks, sets up namespaces |
-| `container/start.go` | ~80 | Signals init process to exec user command |
-| `container/exec.go` | ~430 | Exec command with PTY support |
-| `linux/namespace.go` | ~150 | Namespace flags, setns, ID mappings |
-| `linux/cgroup.go` | ~200 | Memory, CPU, PID limits via cgroups v2 |
-| `linux/rootfs.go` | ~350 | pivot_root, mount setup, path masking |
-| `linux/capabilities.go` | ~250 | Drop/keep Linux capabilities |
-| `linux/seccomp.go` | ~400 | BPF filter generation and installation |
-
----
-
-## How It Works
-
-### The Create/Start Dance
-
-When you run `runc-go run myapp /bundle`:
+## Container Lifecycle
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. PARENT PROCESS (runc-go run)                                 │
-│    - Reads config.json                                          │
-│    - Creates FIFO for synchronization                           │
-│    - Creates cgroup                                             │
-│    - Forks child with CLONE_NEW* flags                          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ fork() with namespace flags
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 2. CHILD PROCESS (runc-go init) - Now in NEW namespaces        │
-│    - Opens FIFO (before pivot_root!)                            │
-│    - Sets hostname                                              │
-│    - Calls pivot_root (changes root filesystem)                 │
-│    - Mounts /proc, /dev, /sys                                   │
-│    - Sets up devices                                            │
-│    - BLOCKS reading from FIFO... waiting for start              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ (parent writes to FIFO)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 3. CHILD CONTINUES                                              │
-│    - Drops capabilities                                         │
-│    - Installs seccomp filter                                    │
-│    - Sets user/group IDs                                        │
-│    - exec() the user's command (e.g., /bin/sh)                  │
-│    - Child process is REPLACED by user's command                │
-└─────────────────────────────────────────────────────────────────┘
+        create              start           exit/kill
+(empty) -----> [created] -------> [running] --------> [stopped]
+                                                          |
+                                                     delete
+                                                          |
+                                                          v
+                                                      (empty)
 ```
 
-### Namespace Magic
+## Security
 
-When we call `fork()` with `CLONE_NEWPID | CLONE_NEWNS | ...`:
+This educational runtime includes security measures:
 
-```
-BEFORE FORK:
-┌────────────────────────────────────────┐
-│ Host Namespace                         │
-│   PID 1: systemd                       │
-│   PID 1000: runc-go                    │
-└────────────────────────────────────────┘
+- **Path traversal protection** - Prevents `../` escapes in mounts and devices
+- **Container ID validation** - Rejects malicious container names
+- **Shell injection prevention** - Properly quotes shell commands
+- **Device whitelist** - Only allows safe device nodes
+- **Architecture-portable syscalls** - Works on x86_64 and ARM64
+- **Restrictive file permissions** - State files use 0600
 
-AFTER FORK:
-┌────────────────────────────────────────┐
-│ Host Namespace                         │
-│   PID 1: systemd                       │
-│   PID 1000: runc-go (parent)           │
-│   PID 1001: runc-go init ─────────────────┐
-└────────────────────────────────────────┘  │
-                                            │
-┌────────────────────────────────────────┐  │
-│ Container Namespace                    │◄─┘
-│   PID 1: runc-go init                  │
-│   (sees itself as PID 1!)              │
-└────────────────────────────────────────┘
-```
+## Testing
 
----
-
-## Development
-
-### Running Tests
+See [testing.md](testing.md) for complete testing instructions.
 
 ```bash
-# Run all tests
+# Run unit tests
 make test
 
-# Run tests with verbose output
-go test -v ./...
-
-# Run tests with coverage report
-make test-coverage
-
-# Run only unit tests (no root required)
-make test-unit
+# Quick Docker test
+sudo docker run --runtime=runc-go --rm -it alpine
 ```
-
-### Test Coverage
-
-The project includes unit tests for core packages:
-
-| Package | Coverage | Tests |
-|---------|----------|-------|
-| `spec/` | 85%+ | Spec types, JSON serialization, state management |
-| `container/` | 70%+ | Lifecycle operations, state persistence |
-| `linux/` | 75%+ | Namespace config, cgroup management |
-
-### Code Quality
-
-```bash
-# Run linter
-make lint
-
-# Format code
-make fmt
-
-# Run all checks
-make check
-```
-
----
 
 ## Differences from Production runc
 
-This is an **educational implementation**. Key differences from the real `runc`:
+| Aspect | runc-go | runc |
+|--------|---------|------|
+| Purpose | Learning | Production |
+| Code size | ~6,000 lines | ~50,000+ lines |
+| Checkpoint/restore | No | Yes |
+| systemd integration | No | Yes |
+| AppArmor/SELinux | No | Yes |
+| Error handling | Basic | Comprehensive |
 
-| Feature | runc-go | Production runc |
-|---------|---------|-----------------|
-| **Purpose** | Learning | Production use |
-| **Code size** | ~5,000 lines | ~50,000+ lines |
-| **Rootless containers** | Basic | Full support |
-| **Seccomp** | Simple filter | Full libseccomp integration |
-| **Checkpoint/Restore** | No | Yes (via CRIU) |
-| **systemd integration** | No | Yes |
-| **Console handling** | PTY support | Full PTY + console socket |
-| **Exec command** | ✅ Supported | ✅ Supported |
-| **Error handling** | Minimal | Comprehensive |
-| **Testing** | 60+ unit tests | Extensive test suite |
+## Requirements
 
-### What's Missing?
+- Linux (containers use Linux-specific features)
+- Go 1.21+
+- Root access (for namespace operations)
+- Docker (optional, for easy testing)
 
-- Full console socket protocol (basic PTY works)
-- Checkpoint/restore (CRIU)
-- systemd cgroup driver
-- AppArmor/SELinux integration
-- Rootless networking
-- Windows support
-- Comprehensive error messages
+## Building
 
-### What's Included?
+```bash
+# Build
+make build
 
-- All core OCI lifecycle operations (create, start, run, exec, kill, delete)
-- Linux namespace isolation (PID, mount, UTS, IPC, network, cgroup)
-- Cgroups v2 resource limits (memory, CPU, PIDs)
-- Capability dropping
-- Basic seccomp filtering
-- Proper create/start separation
-- **Exec command** - Run commands in running containers
-- **PTY support** - Full interactive shell sessions with `-t` flag
-- **Docker integration** - Works as a Docker runtime (`docker exec` supported)
-- Secure state file permissions (0600)
-- Unit test suite (60+ tests)
-- Makefile for easy building and testing
+# Test
+make test
 
----
+# Install
+sudo make install
 
-## Related Projects
+# All targets
+make help
+```
 
-| Project | Description |
-|---------|-------------|
-| [gocr](../gocr) | The simpler educational runtime this builds upon |
-| [runc](https://github.com/opencontainers/runc) | The reference OCI runtime |
-| [crun](https://github.com/containers/crun) | Fast OCI runtime in C |
-| [youki](https://github.com/containers/youki) | OCI runtime in Rust |
+## Learning Resources
 
----
+To understand how this works, read the source in this order:
+
+1. `main.go` - See how commands are dispatched
+2. `container/create.go` - See how containers are created
+3. `linux/namespace.go` - See how isolation works
+4. `linux/rootfs.go` - See how filesystems are set up
+5. `container/exec.go` - See how exec works
 
 ## License
 
-Educational use. Based on concepts from the OCI Runtime Specification and various open-source container runtimes.
-
----
-
-## Quick Reference Card
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     runc-go Quick Reference                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  SETUP BUNDLE:                                                   │
-│    mkdir -p bundle/rootfs                                        │
-│    docker export $(docker create alpine) | tar -xf - -C rootfs   │
-│    runc-go spec > config.json                                    │
-│                                                                  │
-│  RUN CONTAINER:                                                  │
-│    sudo runc-go run <name> <bundle>                              │
-│                                                                  │
-│  LIFECYCLE:                                                      │
-│    sudo runc-go create <name> <bundle>  # Create (paused)        │
-│    sudo runc-go start <name>            # Start                  │
-│    sudo runc-go state <name>            # Check status           │
-│    sudo runc-go kill <name> SIGTERM     # Stop gracefully        │
-│    sudo runc-go delete <name>           # Remove                 │
-│                                                                  │
-│  EXEC (run commands in running containers):                      │
-│    sudo runc-go exec <name> /bin/ls     # Run command            │
-│    sudo runc-go exec -t <name> /bin/sh  # Interactive shell      │
-│                                                                  │
-│  LIST:                                                           │
-│    sudo runc-go list                    # Show all containers    │
-│                                                                  │
-│  STATES: creating → created → running → stopped                  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Changelog
-
-### Recent Improvements
-
-**Security**
-- Fixed state file permissions: changed from 0644 to 0600 for container state files
-
-**New Features**
-- **Exec command**: Run commands in running containers (`runc-go exec`)
-- **PTY support**: Full interactive shell sessions with `-t` flag
-- **Process spec support**: Docker/containerd style `--process` flag for exec
-
-**Testing**
-- Added 60+ unit tests across spec/, container/, and linux/ packages
-- Test coverage: spec/ 85%+, container/ 70%+, linux/ 75%+
-
-**Build System**
-- Added comprehensive Makefile with build, test, coverage, lint, and install targets
-- Added golang.org/x/term dependency for terminal handling
-
-**Docker Integration**
-- Full `docker exec` support when used as Docker runtime
-- Interactive TTY sessions work with `docker exec -it`
+Educational use. Based on concepts from the OCI Runtime Specification.
