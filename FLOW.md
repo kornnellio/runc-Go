@@ -7,16 +7,20 @@ A detailed walkthrough of how runc-go executes, with code navigation.
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Command Dispatch](#command-dispatch)
-3. [The `run` Command](#the-run-command)
-4. [The `create` Command](#the-create-command)
-5. [The `start` Command](#the-start-command)
-6. [The `exec` Command](#the-exec-command)
-7. [Container Init Process](#container-init-process)
-8. [Namespace Setup](#namespace-setup)
-9. [Rootfs Setup](#rootfs-setup)
-10. [Cgroup Setup](#cgroup-setup)
-11. [Security Setup](#security-setup)
+2. [Architecture Overview](#architecture-overview)
+3. [Command Dispatch (Cobra)](#command-dispatch-cobra)
+4. [The `run` Command](#the-run-command)
+5. [The `create` Command](#the-create-command)
+6. [The `start` Command](#the-start-command)
+7. [The `exec` Command](#the-exec-command)
+8. [Container Init Process](#container-init-process)
+9. [Namespace Setup](#namespace-setup)
+10. [Rootfs Setup](#rootfs-setup)
+11. [Cgroup Setup](#cgroup-setup)
+12. [Security Setup](#security-setup)
+13. [Context Propagation](#context-propagation)
+14. [Error Handling Flow](#error-handling-flow)
+15. [Logging Integration](#logging-integration)
 
 ---
 
@@ -25,9 +29,15 @@ A detailed walkthrough of how runc-go executes, with code navigation.
 When you run a container, here's the high-level flow:
 
 ```
-User runs: sudo runc-go run mycontainer /bundle
+User runs: sudo runc-go run mycontainer --bundle /bundle
 
-main.go                     Parse CLI, dispatch to cmdRun()
+main.go                     Call cmd.Execute()
+    │
+    ▼
+cmd/root.go                 Cobra parses flags, dispatches to runRun()
+    │
+    ▼
+cmd/run.go                  Creates context with signal handling
     │
     ▼
 container/create.go         Fork child with namespace flags
@@ -57,194 +67,358 @@ container/create.go         Fork child with namespace flags
 
 ---
 
-## Command Dispatch
+## Architecture Overview
 
-### Entry Point: `main.go:60`
+### Package Structure
 
-```go
-func main() {
-    // Parse global flags (--root, --log, etc.)
-    args := os.Args[1:]
-    for len(args) > 0 {
-        switch {
-        case args[0] == "--root" && len(args) > 1:
-            globalRoot = args[1]
-            // ...
-        }
-    }
+```
+runc-go/
+├── main.go              Entry point - calls cmd.Execute()
+├── cmd/                 Cobra CLI commands
+│   ├── root.go          Root command, global flags, context/logging setup
+│   ├── create.go        create command
+│   ├── start.go         start command
+│   ├── run.go           run command (create + start + wait)
+│   ├── exec.go          exec command
+│   ├── kill.go          kill command
+│   ├── delete.go        delete command
+│   ├── list.go          list command
+│   ├── state.go         state command
+│   ├── spec.go          spec command
+│   ├── version.go       version command
+│   └── init.go          Internal init/exec-init commands
+├── container/           Container lifecycle management
+├── linux/               Linux-specific implementations
+├── spec/                OCI specification types
+├── errors/              Custom error types
+├── logging/             Structured logging with slog
+└── utils/               Utility functions
 ```
 
-### Command Router: `main.go:114`
+### Key Design Patterns
+
+1. **Cobra CLI**: All commands use github.com/spf13/cobra for argument parsing
+2. **Context Propagation**: context.Context flows through all public APIs
+3. **Signal Handling**: SIGINT/SIGTERM trigger graceful cancellation via context
+4. **Custom Errors**: Typed errors with Kind, Operation, and Container ID
+5. **Structured Logging**: slog-based logging with JSON/text output formats
+
+---
+
+## Command Dispatch (Cobra)
+
+### Entry Point: `main.go`
 
 ```go
-    switch cmd {
-    case "create":
-        err = cmdCreate()      // → main.go:168
-    case "start":
-        err = cmdStart()       // → main.go:227
-    case "run":
-        err = cmdRun()         // → main.go:253
-    case "exec":
-        err = cmdExec()        // → main.go:295
-    case "state":
-        err = cmdState()       // → main.go:370
-    case "kill":
-        err = cmdKill()        // → main.go:391
-    case "delete":
-        err = cmdDelete()      // → main.go:420
-    case "list", "ps":
-        err = cmdList()        // → main.go:448
-    case "spec":
-        err = cmdSpec()        // → main.go:480
-    case "init":
-        err = cmdInit()        // → main.go:500 (internal)
-    case "exec-init":
-        err = cmdExecInit()    // → main.go:540 (internal)
+package main
+
+import (
+    "fmt"
+    "os"
+    "runc-go/cmd"
+)
+
+func main() {
+    if err := cmd.Execute(); err != nil {
+        fmt.Fprintf(os.Stderr, "error: %v\n", err)
+        os.Exit(1)
     }
+}
+```
+
+### Root Command: `cmd/root.go`
+
+```go
+var rootCmd = &cobra.Command{
+    Use:   "runc-go",
+    Short: "OCI container runtime in Go",
+    Long:  `A lightweight OCI-compliant container runtime.`,
+    PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+        // Setup logging based on flags
+        return setupLogging()
+    },
+}
+
+// Global flags
+func init() {
+    rootCmd.PersistentFlags().StringVar(&globalRoot, "root", "/run/runc-go",
+        "root directory for storage of container state")
+    rootCmd.PersistentFlags().StringVar(&globalLog, "log", "",
+        "log file path")
+    rootCmd.PersistentFlags().StringVar(&globalLogFormat, "log-format", "text",
+        "log format (text, json)")
+    rootCmd.PersistentFlags().BoolVar(&globalDebug, "debug", false,
+        "enable debug logging")
+    rootCmd.PersistentFlags().BoolVar(&globalSystemdCgroup, "systemd-cgroup", false,
+        "use systemd cgroup driver")
+}
+```
+
+### Context Setup: `cmd/root.go`
+
+```go
+// GetContext returns a context that cancels on SIGINT/SIGTERM
+func GetContext() context.Context {
+    ctx, _ := signal.NotifyContext(context.Background(),
+        syscall.SIGINT, syscall.SIGTERM)
+    return ctx
+}
+
+// GetStateRoot returns the state root directory
+func GetStateRoot() string {
+    return globalRoot
+}
+```
+
+### Command Registration: Each `cmd/*.go`
+
+```go
+// cmd/run.go
+var runCmd = &cobra.Command{
+    Use:   "run <container-id>",
+    Short: "Create and run a container",
+    Args:  cobra.ExactArgs(1),
+    RunE:  runRun,
+}
+
+func init() {
+    rootCmd.AddCommand(runCmd)
+
+    runCmd.Flags().StringVarP(&runBundle, "bundle", "b", ".",
+        "path to the root of the bundle directory")
+    runCmd.Flags().StringVar(&runConsoleSocket, "console-socket", "",
+        "path to AF_UNIX socket for console")
+    runCmd.Flags().StringVar(&runPidFile, "pid-file", "",
+        "path to write container PID")
+    runCmd.Flags().BoolVarP(&runDetach, "detach", "d", false,
+        "detach from the container's process")
+}
 ```
 
 ---
 
 ## The `run` Command
 
-**Command:** `sudo runc-go run mycontainer /bundle`
+**Command:** `sudo runc-go run mycontainer --bundle /bundle`
 
-### Step 1: Parse Arguments
+### Step 1: Cobra Parses Arguments
 
-**File:** `main.go:253`
+**File:** `cmd/run.go`
 
 ```go
-func cmdRun() error {
-    args := parseArgs(os.Args[2:])
+func runRun(cmd *cobra.Command, args []string) error {
+    ctx := GetContext()  // Context with signal handling
 
-    containerID := args.pos(0)  // "mycontainer"
-    bundle := args.pos(1)       // "/bundle"
-
-    // Get options
-    consoleSocket := args.flag("console-socket")
-    pidFile := args.flag("pid-file")
-    detach := args.has("detach") || args.has("d")
+    containerID := args[0]  // "mycontainer"
+    bundle := runBundle     // "/bundle" from --bundle flag
 ```
 
 ### Step 2: Create Container Object
 
-**File:** `main.go:275` → `container/container.go:107`
+**File:** `cmd/run.go` → `container/container.go:107`
 
 ```go
-    // main.go
-    c, err := container.New(containerID, bundle, root)
-
-    // container/container.go:107
-    func New(id, bundle, stateRoot string) (*Container, error) {
-        // Validate container ID (security check)
-        if err := ValidateContainerID(id); err != nil {
-            return nil, err
-        }
-
-        // Load OCI spec from bundle/config.json
-        specPath := filepath.Join(bundle, "config.json")
-        s, err := spec.LoadSpec(specPath)
-
-        // Create state directory /run/runc-go/<id>/
-        stateDir := filepath.Join(stateRoot, id)
-        os.MkdirAll(stateDir, 0700)
-
-        // Initialize container struct
-        c := &Container{
-            ID:       id,
-            Bundle:   bundle,
-            StateDir: stateDir,
-            Spec:     s,
-            State: &spec.ContainerState{
-                Status: spec.StatusCreating,
-                // ...
-            },
-        }
-        return c, nil
+    // Create new container
+    c, err := container.New(ctx, containerID, bundle, GetStateRoot())
+    if err != nil {
+        return err  // Returns *errors.ContainerError
     }
+```
+
+**Container.New with Context:** `container/container.go`
+
+```go
+func New(ctx context.Context, id, bundle, stateRoot string) (*Container, error) {
+    // Check context cancellation
+    select {
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    default:
+    }
+
+    // Get logger from context
+    logger := logging.FromContext(ctx)
+    logger.Debug("creating new container", "id", id, "bundle", bundle)
+
+    // Validate container ID (security check)
+    if err := ValidateContainerID(id); err != nil {
+        return nil, &errors.ContainerError{
+            Op:        "New",
+            Container: id,
+            Kind:      errors.ErrInvalidConfig,
+            Err:       err,
+        }
+    }
+
+    // Load OCI spec from bundle/config.json
+    specPath := filepath.Join(bundle, "config.json")
+    s, err := spec.LoadSpec(specPath)
+    if err != nil {
+        return nil, &errors.ContainerError{
+            Op:        "New",
+            Container: id,
+            Kind:      errors.ErrInvalidConfig,
+            Err:       err,
+        }
+    }
+
+    // Create state directory /run/runc-go/<id>/
+    stateDir := filepath.Join(stateRoot, id)
+    os.MkdirAll(stateDir, 0700)
+
+    // Initialize container struct
+    c := &Container{
+        ID:       id,
+        Bundle:   bundle,
+        StateDir: stateDir,
+        Spec:     s,
+        State: &spec.ContainerState{
+            Status: spec.StatusCreating,
+            // ...
+        },
+    }
+    return c, nil
+}
 ```
 
 ### Step 3: Run (Create + Start + Wait)
 
-**File:** `main.go:282` → `container/create.go:88`
+**File:** `cmd/run.go` → `container/start.go`
 
 ```go
-    // main.go
-    exitCode, err := container.Run(c, opts)
-
-    // container/create.go:88
-    func Run(c *Container, opts *CreateOptions) (int, error) {
-        // Create the container (fork child, setup namespaces)
-        if err := Create(c, opts); err != nil {
-            return -1, err
-        }
-
-        // Start it (signal child to exec)
-        if err := Start(c); err != nil {
-            return -1, err
-        }
-
-        // Wait for exit
-        return Wait(c)
+    opts := &container.CreateOptions{
+        ConsoleSocket: runConsoleSocket,
+        PidFile:       runPidFile,
+        Detach:        runDetach,
     }
+
+    // Run handles create + start + wait
+    exitCode, err := c.Run(ctx, opts)
+    if err != nil {
+        return err
+    }
+
+    os.Exit(exitCode)
+    return nil
+}
+```
+
+**Container.Run:** `container/start.go`
+
+```go
+func (c *Container) Run(ctx context.Context, opts *CreateOptions) (int, error) {
+    // Create the container (fork child, setup namespaces)
+    if err := Create(ctx, c, opts); err != nil {
+        return -1, err
+    }
+
+    // Start it (signal child to exec)
+    if err := c.Start(ctx); err != nil {
+        return -1, err
+    }
+
+    // Wait for exit (respects context cancellation)
+    return c.Wait(ctx)
+}
 ```
 
 ---
 
 ## The `create` Command
 
-**Command:** `sudo runc-go create mycontainer /bundle`
+**Command:** `sudo runc-go create mycontainer --bundle /bundle`
 
 This is the heart of container creation.
 
-### Step 1: Setup Synchronization
+### Step 1: Cobra Parses Arguments
 
-**File:** `container/create.go:105`
+**File:** `cmd/create.go`
 
 ```go
-func Create(c *Container, opts *CreateOptions) error {
+var createCmd = &cobra.Command{
+    Use:   "create <container-id>",
+    Short: "Create a container",
+    Long:  `Create a container but do not start it.`,
+    Args:  cobra.ExactArgs(1),
+    RunE:  runCreate,
+}
+
+func runCreate(cmd *cobra.Command, args []string) error {
+    ctx := GetContext()
+    containerID := args[0]
+```
+
+### Step 2: Setup Synchronization
+
+**File:** `container/create.go`
+
+```go
+func Create(ctx context.Context, c *Container, opts *CreateOptions) error {
+    // Check context cancellation
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+    }
+
+    logger := logging.FromContext(ctx)
+    logger.Info("creating container", "id", c.ID)
+
     s := c.Spec
 
     // Create FIFO for create/start synchronization
     // Child will block reading this until start is called
     if err := c.CreateExecFifo(); err != nil {
-        return err
+        return &errors.ContainerError{
+            Op:        "Create",
+            Container: c.ID,
+            Kind:      errors.ErrResource,
+            Err:       err,
+        }
     }
     // Creates /run/runc-go/<id>/exec.fifo
 ```
 
-### Step 2: Setup Cgroup
+### Step 3: Setup Cgroup
 
-**File:** `container/create.go:115` → `linux/cgroup.go`
+**File:** `container/create.go` → `linux/cgroup.go`
 
 ```go
     // Create cgroup for resource limits
     cgroupPath := filepath.Join("/sys/fs/cgroup", "runc-go", c.ID)
-    cg, err := linux.NewCgroup(cgroupPath)
+    cg, err := linux.NewCgroup(ctx, cgroupPath)
+    if err != nil {
+        return err
+    }
 
     // Apply resource limits from config.json
     if s.Linux != nil && s.Linux.Resources != nil {
-        cg.ApplyResources(s.Linux.Resources)
+        if err := cg.ApplyResources(ctx, s.Linux.Resources); err != nil {
+            logger.Warn("failed to apply some resources", "error", err)
+        }
     }
 ```
 
-### Step 3: Setup Console (PTY)
+### Step 4: Setup Console (PTY)
 
-**File:** `container/create.go:130`
+**File:** `container/create.go`
 
 ```go
     // If terminal requested, create PTY
     var console *utils.Console
     if s.Process.Terminal {
         console, err = utils.NewConsole()
+        if err != nil {
+            return err
+        }
         // console.Master() = PTY master (parent keeps this)
         // console.SlavePath() = /dev/pts/N (child uses this)
     }
 ```
 
-### Step 4: Build Process Attributes
+### Step 5: Build Process Attributes
 
-**File:** `container/create.go:145` → `linux/namespace.go:103`
+**File:** `container/create.go` → `linux/namespace.go`
 
 ```go
     // Get self executable for re-exec
@@ -254,23 +428,19 @@ func Create(c *Container, opts *CreateOptions) error {
     cmd := exec.Command(self, "init")
 
     // Build namespace flags from config
-    // linux/namespace.go:103
-    func BuildSysProcAttr(s *spec.Spec) (*syscall.SysProcAttr, error) {
-        flags := NamespaceFlags(s.Linux.Namespaces)
-        // flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | ...
-
-        return &syscall.SysProcAttr{
-            Cloneflags: flags,  // Create new namespaces
-            Setsid:     true,   // New session
-        }, nil
-    }
+    // linux/namespace.go
+    attr, err := linux.BuildSysProcAttr(s)
+    // Returns &syscall.SysProcAttr{
+    //     Cloneflags: CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | ...,
+    //     Setsid:     true,
+    // }
 
     cmd.SysProcAttr = attr
 ```
 
-### Step 5: Pass Config to Child
+### Step 6: Pass Config to Child
 
-**File:** `container/create.go:165`
+**File:** `container/create.go`
 
 ```go
     // Pass information via environment variables
@@ -285,26 +455,33 @@ func Create(c *Container, opts *CreateOptions) error {
     cmd.ExtraFiles = []*os.File{syncPipe.Child()}
 ```
 
-### Step 6: Fork Child Process
+### Step 7: Fork Child Process
 
-**File:** `container/create.go:180`
+**File:** `container/create.go`
 
 ```go
     // START THE CHILD PROCESS
     // This forks with CLONE_NEW* flags
     // Child is now in NEW namespaces!
+    logger.Debug("starting container init process")
     if err := cmd.Start(); err != nil {
-        return err
+        return &errors.ContainerError{
+            Op:        "Create",
+            Container: c.ID,
+            Kind:      errors.ErrNamespace,
+            Err:       err,
+        }
     }
 
     // Save PID
     c.InitProcess = cmd.Process.Pid
     c.State.Pid = c.InitProcess
+    logger.Info("container process started", "pid", c.InitProcess)
 ```
 
-### Step 7: Parent Waits
+### Step 8: Parent Waits
 
-**File:** `container/create.go:195`
+**File:** `container/create.go`
 
 ```go
     // Send PTY master to console socket (if Docker is listening)
@@ -319,6 +496,7 @@ func Create(c *Container, opts *CreateOptions) error {
     c.State.Status = spec.StatusCreated
     c.SaveState()
 
+    logger.Info("container created", "id", c.ID, "status", "created")
     // Parent is done - child is blocked on exec FIFO
     return nil
 ```
@@ -329,12 +507,53 @@ func Create(c *Container, opts *CreateOptions) error {
 
 **Command:** `sudo runc-go start mycontainer`
 
-### Unblock the Child
-
-**File:** `container/start.go:20`
+### Cobra Handler: `cmd/start.go`
 
 ```go
-func Start(c *Container) error {
+var startCmd = &cobra.Command{
+    Use:   "start <container-id>",
+    Short: "Start a created container",
+    Args:  cobra.ExactArgs(1),
+    RunE:  runStart,
+}
+
+func runStart(cmd *cobra.Command, args []string) error {
+    ctx := GetContext()
+    containerID := args[0]
+
+    c, err := container.Load(ctx, containerID, GetStateRoot())
+    if err != nil {
+        return err
+    }
+
+    return c.Start(ctx)
+}
+```
+
+### Unblock the Child: `container/start.go`
+
+```go
+func (c *Container) Start(ctx context.Context) error {
+    // Check context cancellation
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+    }
+
+    logger := logging.FromContext(ctx)
+    logger.Info("starting container", "id", c.ID)
+
+    // Verify container is in created state
+    if c.State.Status != spec.StatusCreated {
+        return &errors.ContainerError{
+            Op:        "Start",
+            Container: c.ID,
+            Kind:      errors.ErrInvalidState,
+            Err:       errors.ErrContainerNotCreated,
+        }
+    }
+
     // Open the exec FIFO for writing
     // This unblocks the child who is reading it
     fifoPath := c.ExecFifoPath()
@@ -355,6 +574,7 @@ func Start(c *Container) error {
     // Remove FIFO (no longer needed)
     os.Remove(fifoPath)
 
+    logger.Info("container started", "id", c.ID)
     return nil
 }
 ```
@@ -365,24 +585,82 @@ func Start(c *Container) error {
 
 **Command:** `sudo runc-go exec -t mycontainer /bin/sh`
 
-### Step 1: Load Container
+### Step 1: Cobra Handler
 
-**File:** `container/exec.go:74`
+**File:** `cmd/exec.go`
 
 ```go
-func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error {
+var execCmd = &cobra.Command{
+    Use:   "exec <container-id> <command> [args...]",
+    Short: "Execute a process in a running container",
+    Args:  cobra.MinimumNArgs(2),
+    RunE:  runExec,
+}
+
+var (
+    execTty     bool
+    execCwd     string
+    execEnv     []string
+    execProcess string
+)
+
+func init() {
+    rootCmd.AddCommand(execCmd)
+
+    execCmd.Flags().BoolVarP(&execTty, "tty", "t", false,
+        "allocate a pseudo-TTY")
+    execCmd.Flags().StringVar(&execCwd, "cwd", "",
+        "current working directory")
+    execCmd.Flags().StringArrayVarP(&execEnv, "env", "e", nil,
+        "set environment variables")
+    execCmd.Flags().StringVarP(&execProcess, "process", "p", "",
+        "path to process.json")
+}
+
+func runExec(cmd *cobra.Command, args []string) error {
+    ctx := GetContext()
+
+    containerID := args[0]
+    command := args[1:]
+```
+
+### Step 2: Load Container
+
+**File:** `container/exec.go`
+
+```go
+func Exec(ctx context.Context, containerID, stateRoot string, args []string, opts *ExecOptions) error {
+    // Check context
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+    }
+
+    logger := logging.FromContext(ctx)
+
     // Load existing container
-    c, err := Load(containerID, stateRoot)
+    c, err := Load(ctx, containerID, stateRoot)
+    if err != nil {
+        return err
+    }
 
     // Verify it's running
     if c.State.Status != spec.StatusRunning {
-        return fmt.Errorf("container is not running")
+        return &errors.ContainerError{
+            Op:        "Exec",
+            Container: containerID,
+            Kind:      errors.ErrInvalidState,
+            Err:       errors.ErrContainerNotRunning,
+        }
     }
+
+    logger.Info("executing in container", "id", containerID, "args", args)
 ```
 
-### Step 2: Build exec-init Command
+### Step 3: Build exec-init Command
 
-**File:** `container/exec.go:106`
+**File:** `container/exec.go`
 
 ```go
     // Get our executable
@@ -400,9 +678,9 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
     )
 ```
 
-### Step 3: Handle TTY
+### Step 4: Handle TTY
 
-**File:** `container/exec.go:169`
+**File:** `container/exec.go`
 
 ```go
     if opts.Tty {
@@ -428,9 +706,9 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
     }
 ```
 
-### Step 4: exec-init Joins Namespaces
+### Step 5: exec-init Joins Namespaces
 
-**File:** `container/exec.go:400`
+**File:** `container/exec.go`
 
 ```go
 func ExecInit() error {
@@ -450,7 +728,7 @@ func ExecInit() error {
         "--",
     }
 
-    // Add command with proper quoting
+    // Add command with proper quoting (security: prevent injection)
     shellCmd := fmt.Sprintf("cd %s && exec %s",
         shellQuoteArg(cwd),
         shellQuoteArgs(args))
@@ -467,21 +745,29 @@ func ExecInit() error {
 
 When the child process starts, it runs `runc-go init`.
 
-### Entry: `main.go:500`
+### Cobra Handler: `cmd/init.go`
 
 ```go
-func cmdInit() error {
+var initCmd = &cobra.Command{
+    Use:    "init",
+    Short:  "Initialize the container (internal use)",
+    Long:   `Internal command called inside the container namespace to complete setup.`,
+    Hidden: true,  // Not shown in --help
+    Args:   cobra.NoArgs,
+    RunE:   runInit,
+}
+
+func runInit(cmd *cobra.Command, args []string) error {
     // This runs INSIDE the new namespaces
     // but BEFORE pivot_root
-
-    return container.Init()
+    return container.InitContainer()
 }
 ```
 
-### Init Flow: `container/create.go:220`
+### Init Flow: `container/create.go`
 
 ```go
-func Init() error {
+func InitContainer() error {
     // Get bundle path from environment
     bundle := os.Getenv("_RUNC_GO_BUNDLE")
 
@@ -497,7 +783,7 @@ func Init() error {
 
 ### Step 2: Setup Hostname
 
-**File:** `container/create.go:235` → `linux/namespace.go:187`
+**File:** `container/create.go` → `linux/namespace.go`
 
 ```go
     // Set hostname in UTS namespace
@@ -509,11 +795,11 @@ func Init() error {
 
 ### Step 3: Setup Rootfs
 
-**File:** `container/create.go:240` → `linux/rootfs.go:63`
+**File:** `container/create.go` → `linux/rootfs.go`
 
 ```go
     // Setup root filesystem
-    linux.SetupRootfs(s, bundle)
+    linux.SetupRootfs(ctx, s, bundle)
     // This does:
     // 1. Bind mount rootfs to itself
     // 2. Setup all mounts from config
@@ -524,7 +810,7 @@ func Init() error {
 
 ### Step 4: Setup Devices
 
-**File:** `container/create.go:250` → `linux/devices.go`
+**File:** `container/create.go` → `linux/devices.go`
 
 ```go
     // Create device nodes
@@ -538,7 +824,7 @@ func Init() error {
 
 ### Step 5: Setup Console
 
-**File:** `container/create.go:260`
+**File:** `container/create.go`
 
 ```go
     // If terminal requested, setup PTY slave
@@ -563,7 +849,7 @@ func Init() error {
 
 ### Step 6: Block on FIFO (Wait for Start)
 
-**File:** `container/create.go:280`
+**File:** `container/create.go`
 
 ```go
     // READ FROM FIFO - THIS BLOCKS!
@@ -577,17 +863,29 @@ func Init() error {
 
 ### Step 7: Apply Security
 
-**File:** `container/create.go:290`
+**File:** `container/create.go`
 
 ```go
     // Drop capabilities
     if s.Process.Capabilities != nil {
-        linux.ApplyCapabilities(s.Process.Capabilities)
+        if err := linux.ApplyCapabilities(s.Process.Capabilities); err != nil {
+            return &errors.ContainerError{
+                Op:   "InitContainer",
+                Kind: errors.ErrCapability,
+                Err:  err,
+            }
+        }
     }
 
     // Install seccomp filter
     if s.Linux != nil && s.Linux.Seccomp != nil {
-        linux.SetupSeccomp(s.Linux.Seccomp)
+        if err := linux.SetupSeccomp(s.Linux.Seccomp); err != nil {
+            return &errors.ContainerError{
+                Op:   "InitContainer",
+                Kind: errors.ErrSeccomp,
+                Err:  err,
+            }
+        }
     }
 
     // Set user/group
@@ -599,7 +897,7 @@ func Init() error {
 
 ### Step 8: Exec User Command
 
-**File:** `container/create.go:310`
+**File:** `container/create.go`
 
 ```go
     // Change to working directory
@@ -626,7 +924,7 @@ func Init() error {
 
 ### Building Namespace Flags
 
-**File:** `linux/namespace.go:36`
+**File:** `linux/namespace.go`
 
 ```go
 func NamespaceFlags(namespaces []spec.LinuxNamespace) uintptr {
@@ -660,7 +958,7 @@ func NamespaceFlags(namespaces []spec.LinuxNamespace) uintptr {
 
 ### Joining Existing Namespaces
 
-**File:** `linux/namespace.go:72`
+**File:** `linux/namespace.go`
 
 ```go
 func SetNamespaces(namespaces []spec.LinuxNamespace) error {
@@ -692,15 +990,26 @@ func setns(path string, nsType spec.LinuxNamespaceType) error {
 
 ### Main Setup Function
 
-**File:** `linux/rootfs.go:63`
+**File:** `linux/rootfs.go`
 
 ```go
-func SetupRootfs(s *spec.Spec, bundlePath string) error {
+func SetupRootfs(ctx context.Context, s *spec.Spec, bundlePath string) error {
+    // Check context cancellation
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+    }
+
+    logger := logging.FromContext(ctx)
+
     // Get absolute rootfs path
     rootfs := s.Root.Path
     if !filepath.IsAbs(rootfs) {
         rootfs = filepath.Join(bundlePath, rootfs)
     }
+
+    logger.Debug("setting up rootfs", "path", rootfs)
 
     // Make mount tree private (prevent propagation to host)
     syscall.Mount("", "/", "", MS_REC|MS_PRIVATE, "")
@@ -723,9 +1032,41 @@ func SetupRootfs(s *spec.Spec, bundlePath string) error {
 }
 ```
 
+### Secure Path Joining
+
+**File:** `linux/rootfs.go`
+
+```go
+// SecureJoin safely joins paths preventing directory traversal attacks
+func SecureJoin(rootfs, unsafePath string) (string, error) {
+    // Clean the path
+    cleanPath := filepath.Clean(unsafePath)
+
+    // Join with rootfs
+    fullPath := filepath.Join(rootfs, cleanPath)
+
+    // Resolve symlinks
+    resolved, err := filepath.EvalSymlinks(fullPath)
+    if err != nil && !os.IsNotExist(err) {
+        return "", err
+    }
+
+    // Verify the resolved path is still under rootfs
+    if !strings.HasPrefix(resolved, rootfs) {
+        return "", &errors.ContainerError{
+            Op:   "SecureJoin",
+            Kind: errors.ErrPathTraversal,
+            Err:  fmt.Errorf("path %q escapes rootfs", unsafePath),
+        }
+    }
+
+    return fullPath, nil
+}
+```
+
 ### Mount Setup
 
-**File:** `linux/rootfs.go:208`
+**File:** `linux/rootfs.go`
 
 ```go
 func setupMounts(mounts []spec.Mount, rootfs string) error {
@@ -754,7 +1095,7 @@ func setupMounts(mounts []spec.Mount, rootfs string) error {
 
 ### Pivot Root
 
-**File:** `linux/rootfs.go:136`
+**File:** `linux/rootfs.go`
 
 ```go
 func pivotRoot(rootfs string) error {
@@ -808,10 +1149,13 @@ AFTER pivot_root:
 
 ### Create Cgroup
 
-**File:** `linux/cgroup.go:30`
+**File:** `linux/cgroup.go`
 
 ```go
-func NewCgroup(path string) (*Cgroup, error) {
+func NewCgroup(ctx context.Context, path string) (*Cgroup, error) {
+    logger := logging.FromContext(ctx)
+    logger.Debug("creating cgroup", "path", path)
+
     // Create cgroup directory
     // e.g., /sys/fs/cgroup/runc-go/mycontainer/
     if err := os.MkdirAll(path, 0755); err != nil {
@@ -827,15 +1171,18 @@ func NewCgroup(path string) (*Cgroup, error) {
 
 ### Apply Resource Limits
 
-**File:** `linux/cgroup.go:80`
+**File:** `linux/cgroup.go`
 
 ```go
-func (c *Cgroup) ApplyResources(resources *spec.LinuxResources) error {
+func (c *Cgroup) ApplyResources(ctx context.Context, resources *spec.LinuxResources) error {
+    logger := logging.FromContext(ctx)
+
     // Memory limit
     if resources.Memory != nil && resources.Memory.Limit != nil {
+        limit := *resources.Memory.Limit
+        logger.Debug("setting memory limit", "bytes", limit)
         // Write to memory.max
         // e.g., echo "536870912" > /sys/fs/cgroup/.../memory.max
-        limit := *resources.Memory.Limit
         os.WriteFile(
             filepath.Join(c.path, "memory.max"),
             []byte(strconv.FormatInt(limit, 10)),
@@ -856,6 +1203,7 @@ func (c *Cgroup) ApplyResources(resources *spec.LinuxResources) error {
 
     // PID limit
     if resources.Pids != nil && resources.Pids.Limit > 0 {
+        logger.Debug("setting pids limit", "max", resources.Pids.Limit)
         // Write to pids.max
         os.WriteFile(
             filepath.Join(c.path, "pids.max"),
@@ -870,7 +1218,7 @@ func (c *Cgroup) ApplyResources(resources *spec.LinuxResources) error {
 
 ### Add Process to Cgroup
 
-**File:** `linux/cgroup.go:45`
+**File:** `linux/cgroup.go`
 
 ```go
 func (c *Cgroup) AddProcess(pid int) error {
@@ -887,7 +1235,7 @@ func (c *Cgroup) AddProcess(pid int) error {
 
 ### Capabilities
 
-**File:** `linux/capabilities.go:163`
+**File:** `linux/capabilities.go`
 
 ```go
 func ApplyCapabilities(caps *spec.LinuxCapabilities) error {
@@ -895,7 +1243,13 @@ func ApplyCapabilities(caps *spec.LinuxCapabilities) error {
     syscall.Syscall(syscall.SYS_PRCTL, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR, 0)
 
     // Drop capabilities not in bounding set
-    applyBounding(caps.Bounding)
+    if err := applyBounding(caps.Bounding); err != nil {
+        return &errors.ContainerError{
+            Op:   "ApplyCapabilities",
+            Kind: errors.ErrCapability,
+            Err:  err,
+        }
+    }
 
     // Set effective, permitted, inheritable
     header := capHeader{Version: LINUX_CAPABILITY_VERSION_3}
@@ -916,7 +1270,7 @@ func ApplyCapabilities(caps *spec.LinuxCapabilities) error {
 
 ### Seccomp
 
-**File:** `linux/seccomp.go:184`
+**File:** `linux/seccomp.go`
 
 ```go
 func SetupSeccomp(config *spec.LinuxSeccomp) error {
@@ -924,7 +1278,14 @@ func SetupSeccomp(config *spec.LinuxSeccomp) error {
     syscall.Syscall(syscall.SYS_PRCTL, PR_SET_NO_NEW_PRIVS, 1, 0)
 
     // Build BPF filter
-    filter := buildSeccompFilter(config)
+    filter, err := buildSeccompFilter(config)
+    if err != nil {
+        return &errors.ContainerError{
+            Op:   "SetupSeccomp",
+            Kind: errors.ErrSeccomp,
+            Err:  err,
+        }
+    }
 
     // Install filter
     prog := sockFprog{
@@ -943,28 +1304,232 @@ func SetupSeccomp(config *spec.LinuxSeccomp) error {
 
 ---
 
+## Context Propagation
+
+Context flows through the entire system for cancellation and timeout support.
+
+### Signal Handling Setup
+
+**File:** `cmd/root.go`
+
+```go
+func GetContext() context.Context {
+    // Create context that cancels on SIGINT/SIGTERM
+    ctx, cancel := signal.NotifyContext(context.Background(),
+        syscall.SIGINT, syscall.SIGTERM)
+
+    // Cancel is called automatically when signal received
+    _ = cancel  // Stored for cleanup if needed
+
+    return ctx
+}
+```
+
+### Context Check Pattern
+
+All long-running operations check for context cancellation:
+
+```go
+func SomeOperation(ctx context.Context, ...) error {
+    // Check at entry
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+    }
+
+    // ... do work ...
+
+    // Check periodically in loops
+    for i := 0; i < len(items); i++ {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+        }
+        // process item
+    }
+
+    return nil
+}
+```
+
+### Context Flow Diagram
+
+```
+GetContext() [cmd/root.go]
+    │
+    ▼
+runCreate(cmd, args) [cmd/create.go]
+    │
+    ├─► container.New(ctx, ...) [container/container.go]
+    │
+    ├─► Create(ctx, c, opts) [container/create.go]
+    │       │
+    │       ├─► linux.NewCgroup(ctx, ...) [linux/cgroup.go]
+    │       │
+    │       └─► linux.SetupRootfs(ctx, ...) [linux/rootfs.go]
+    │
+    └─► c.Start(ctx) [container/start.go]
+            │
+            └─► c.Wait(ctx) [container/start.go]
+```
+
+---
+
+## Error Handling Flow
+
+### Custom Error Types
+
+**File:** `errors/errors.go`
+
+```go
+type ErrorKind int
+
+const (
+    ErrNotFound ErrorKind = iota
+    ErrAlreadyExists
+    ErrInvalidState
+    ErrInvalidConfig
+    ErrPermission
+    ErrResource
+    ErrNamespace
+    ErrCgroup
+    ErrSeccomp
+    ErrCapability
+    ErrDevice
+    ErrRootfs
+    ErrPathTraversal
+)
+
+type ContainerError struct {
+    Op        string     // Operation that failed
+    Container string     // Container ID (if applicable)
+    Kind      ErrorKind  // Error category
+    Err       error      // Underlying error
+}
+
+func (e *ContainerError) Error() string {
+    if e.Container != "" {
+        return fmt.Sprintf("%s: container %s: %v", e.Op, e.Container, e.Err)
+    }
+    return fmt.Sprintf("%s: %v", e.Op, e.Err)
+}
+
+func (e *ContainerError) Unwrap() error {
+    return e.Err
+}
+```
+
+### Error Checking Pattern
+
+```go
+err := container.Load(ctx, id, stateRoot)
+if err != nil {
+    // Check for specific error kind
+    var containerErr *errors.ContainerError
+    if errors.As(err, &containerErr) {
+        switch containerErr.Kind {
+        case errors.ErrNotFound:
+            fmt.Fprintf(os.Stderr, "container %s not found\n", id)
+            return 1
+        case errors.ErrInvalidState:
+            fmt.Fprintf(os.Stderr, "container in wrong state: %v\n", err)
+            return 1
+        }
+    }
+    // Generic error
+    return err
+}
+```
+
+---
+
+## Logging Integration
+
+### Logger Setup
+
+**File:** `cmd/root.go`
+
+```go
+func setupLogging() error {
+    var handler slog.Handler
+    var output io.Writer = os.Stderr
+
+    // Use log file if specified
+    if globalLog != "" {
+        f, err := os.OpenFile(globalLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+        if err != nil {
+            return err
+        }
+        output = f
+    }
+
+    // Set log level
+    level := slog.LevelInfo
+    if globalDebug {
+        level = slog.LevelDebug
+    }
+
+    opts := &slog.HandlerOptions{Level: level}
+
+    // Create handler based on format
+    switch globalLogFormat {
+    case "json":
+        handler = slog.NewJSONHandler(output, opts)
+    default:
+        handler = slog.NewTextHandler(output, opts)
+    }
+
+    // Set default logger
+    slog.SetDefault(slog.New(handler))
+
+    return nil
+}
+```
+
+### Log Output Examples
+
+**Text format:**
+```
+time=2024-01-15T10:30:00.000Z level=INFO msg="creating container" id=mycontainer bundle=/bundle
+time=2024-01-15T10:30:00.050Z level=DEBUG msg="setting up rootfs" path=/bundle/rootfs
+time=2024-01-15T10:30:00.100Z level=INFO msg="container process started" pid=12345
+```
+
+**JSON format:**
+```json
+{"time":"2024-01-15T10:30:00.000Z","level":"INFO","msg":"creating container","id":"mycontainer","bundle":"/bundle"}
+{"time":"2024-01-15T10:30:00.050Z","level":"DEBUG","msg":"setting up rootfs","path":"/bundle/rootfs"}
+{"time":"2024-01-15T10:30:00.100Z","level":"INFO","msg":"container process started","pid":12345}
+```
+
+---
+
 ## Summary: Complete `run` Flow
 
 ```
-1. main()                           Parse args, dispatch to cmdRun()
+1. main()                           Call cmd.Execute()
    │
-2. cmdRun()                         Parse container ID, bundle path
+2. Cobra parses                     Parse flags, find "run" command
    │
-3. container.New()                  Create Container struct, load spec
+3. runRun()                         Get context with signal handling
    │
-4. container.Run()                  Orchestrate create/start/wait
+4. container.New(ctx, ...)          Create Container struct, load spec
    │
-5. container.Create()
+5. c.Run(ctx, opts)                 Orchestrate create/start/wait
+   │
+6. Create(ctx, c, opts)
    ├── CreateExecFifo()             Create sync FIFO
-   ├── NewCgroup()                  Create cgroup
+   ├── NewCgroup(ctx, ...)          Create cgroup
    ├── NewConsole()                 Create PTY (if terminal)
    ├── BuildSysProcAttr()           Build namespace flags
    ├── cmd.Start()                  FORK! Child in new namespaces
    │   │
-   │   └── [CHILD] cmdInit()
+   │   └── [CHILD] InitContainer()
    │       ├── Open exec FIFO       (Get handle before pivot_root)
    │       ├── SetHostname()        Set container hostname
-   │       ├── SetupRootfs()
+   │       ├── SetupRootfs(ctx,.)
    │       │   ├── setupMounts()    Mount proc, dev, sys, etc.
    │       │   └── pivotRoot()      Change root filesystem
    │       ├── SetupDefaultDevices() Create /dev/null, etc.
@@ -982,11 +1547,29 @@ func SetupSeccomp(config *spec.LinuxSeccomp) error {
    ├── AddProcess()                 Add child to cgroup
    └── SaveState()                  Write state.json
    │
-6. container.Start()
+7. c.Start(ctx)
    └── Write to FIFO                Unblock child
    │
-7. container.Wait()
+8. c.Wait(ctx)
    └── cmd.Wait()                   Wait for child to exit
    │
-8. Return exit code
+9. Return exit code
 ```
+
+---
+
+## Quick Reference: Key Files
+
+| Component | File | Key Functions |
+|-----------|------|---------------|
+| Entry point | `main.go` | `main()` |
+| CLI commands | `cmd/*.go` | `runCreate()`, `runStart()`, `runRun()`, etc. |
+| Container lifecycle | `container/*.go` | `New()`, `Create()`, `Start()`, `Run()`, `Wait()` |
+| Namespaces | `linux/namespace.go` | `NamespaceFlags()`, `BuildSysProcAttr()` |
+| Rootfs | `linux/rootfs.go` | `SetupRootfs()`, `SecureJoin()`, `pivotRoot()` |
+| Cgroups | `linux/cgroup.go` | `NewCgroup()`, `ApplyResources()` |
+| Capabilities | `linux/capabilities.go` | `ApplyCapabilities()` |
+| Seccomp | `linux/seccomp.go` | `SetupSeccomp()`, `buildSeccompFilter()` |
+| Devices | `linux/devices.go` | `SetupDefaultDevices()` |
+| Errors | `errors/errors.go` | `ContainerError`, error kinds |
+| Logging | `logging/logger.go` | `FromContext()`, `NewLogger()` |

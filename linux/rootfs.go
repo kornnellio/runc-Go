@@ -8,38 +8,146 @@ import (
 	"strings"
 	"syscall"
 
+	cerrors "runc-go/errors"
 	"runc-go/spec"
 )
 
 // SecureJoin safely joins a base path with an untrusted path component,
 // ensuring the result is within the base path (prevents path traversal).
+// This function resolves symlinks to prevent symlink-based escape attacks.
 func SecureJoin(base, unsafePath string) (string, error) {
-	// Clean the base path
-	base = filepath.Clean(base)
+	// Check for empty base first
 	if base == "" {
-		return "", fmt.Errorf("base path cannot be empty")
+		return "", cerrors.New(cerrors.ErrInvalidConfig, "secure join", "base path cannot be empty")
 	}
 
-	// Handle absolute paths by stripping leading /
+	// Clean and resolve the base path
+	base = filepath.Clean(base)
+
+	// Resolve base to get absolute path without symlinks
+	resolvedBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", cerrors.Wrap(err, cerrors.ErrInvalidConfig, "abs base path")
+	}
+
+	// If base exists, resolve any symlinks in it
+	if _, err := os.Lstat(resolvedBase); err == nil {
+		resolvedBase, err = filepath.EvalSymlinks(resolvedBase)
+		if err != nil {
+			return "", cerrors.Wrap(err, cerrors.ErrInvalidConfig, "resolve base symlinks")
+		}
+	}
+
+	// Handle empty or . path
 	unsafePath = filepath.Clean("/" + unsafePath)
+	if unsafePath == "/" {
+		return resolvedBase, nil
+	}
 
-	// Join and clean
-	joined := filepath.Join(base, unsafePath)
-	joined = filepath.Clean(joined)
+	// Split the unsafe path into components
+	components := strings.Split(strings.TrimPrefix(unsafePath, "/"), string(filepath.Separator))
 
-	// Verify the result is within base
-	// Add trailing slash to base for proper prefix matching
+	// Walk through each component, resolving symlinks at each step
+	current := resolvedBase
+	for _, component := range components {
+		if component == "" || component == "." {
+			continue
+		}
+
+		// Join the next component
+		next := filepath.Join(current, component)
+
+		// Check if this path exists
+		info, err := os.Lstat(next)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Path doesn't exist yet - this is OK for mount destinations
+				// Just verify the current resolved path is still under base
+				if !isPathWithin(next, resolvedBase) {
+					return "", cerrors.WrapWithDetail(nil, cerrors.ErrInvalidConfig, "secure join",
+						fmt.Sprintf("path component %q escapes base %q", component, resolvedBase))
+				}
+				current = next
+				continue
+			}
+			return "", cerrors.Wrap(err, cerrors.ErrInvalidConfig, "lstat path")
+		}
+
+		// If it's a symlink, resolve it and verify it stays within base
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Read the symlink target
+			target, err := os.Readlink(next)
+			if err != nil {
+				return "", cerrors.Wrap(err, cerrors.ErrInvalidConfig, "readlink")
+			}
+
+			// Resolve the target (which might be relative or absolute)
+			var resolved string
+			if filepath.IsAbs(target) {
+				// Absolute symlink - resolve within base
+				// This is a potential escape, so we recurse with the target
+				resolved, err = SecureJoin(resolvedBase, target)
+				if err != nil {
+					return "", cerrors.WrapWithDetail(err, cerrors.ErrInvalidConfig, "secure join",
+						fmt.Sprintf("symlink %q points to %q which escapes rootfs", next, target))
+				}
+			} else {
+				// Relative symlink - resolve from current directory
+				resolved = filepath.Join(filepath.Dir(next), target)
+				resolved = filepath.Clean(resolved)
+
+				// Check if the resolved path escapes base
+				if !isPathWithin(resolved, resolvedBase) {
+					return "", cerrors.WrapWithDetail(nil, cerrors.ErrInvalidConfig, "secure join",
+						fmt.Sprintf("symlink %q points to %q which escapes rootfs", next, target))
+				}
+
+				// If the resolved path exists and is also a symlink, we need to resolve further
+				resolvedInfo, err := os.Lstat(resolved)
+				if err == nil && resolvedInfo.Mode()&os.ModeSymlink != 0 {
+					// Recursively resolve
+					relPath, err := filepath.Rel(resolvedBase, resolved)
+					if err != nil {
+						return "", cerrors.Wrap(err, cerrors.ErrInvalidConfig, "rel path")
+					}
+					resolved, err = SecureJoin(resolvedBase, relPath)
+					if err != nil {
+						return "", err
+					}
+				}
+			}
+
+			current = resolved
+		} else {
+			// Not a symlink, just use the path
+			if !isPathWithin(next, resolvedBase) {
+				return "", cerrors.WrapWithDetail(nil, cerrors.ErrInvalidConfig, "secure join",
+					fmt.Sprintf("path %q escapes base %q", next, resolvedBase))
+			}
+			current = next
+		}
+	}
+
+	return current, nil
+}
+
+// isPathWithin checks if path is within or equal to base.
+func isPathWithin(path, base string) bool {
+	// Clean both paths
+	path = filepath.Clean(path)
+	base = filepath.Clean(base)
+
+	// Path must either equal base or start with base/
+	if path == base {
+		return true
+	}
+
 	baseWithSlash := base
 	if !strings.HasSuffix(baseWithSlash, string(filepath.Separator)) {
 		baseWithSlash += string(filepath.Separator)
 	}
 
-	// The joined path must either equal base or start with base/
-	if joined != base && !strings.HasPrefix(joined, baseWithSlash) {
-		return "", fmt.Errorf("path %q escapes base %q", unsafePath, base)
-	}
-
-	return joined, nil
+	return strings.HasPrefix(path, baseWithSlash)
 }
 
 // Mount propagation flags
@@ -93,7 +201,7 @@ var mountOptionFlags = map[string]uintptr{
 // SetupRootfs sets up the container's root filesystem.
 func SetupRootfs(s *spec.Spec, bundlePath string) error {
 	if s.Root == nil {
-		return fmt.Errorf("no root filesystem specified")
+		return cerrors.ErrMissingRootfs
 	}
 
 	// Get absolute rootfs path

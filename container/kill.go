@@ -2,9 +2,12 @@
 package container
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"syscall"
+
+	cerrors "runc-go/errors"
 )
 
 // SignalMap maps signal names to signal numbers.
@@ -91,8 +94,15 @@ func ParseSignal(s string) (syscall.Signal, error) {
 }
 
 // Kill sends a signal to the container's init process.
-func Kill(id, stateRoot string, sig syscall.Signal, all bool) error {
-	c, err := Load(id, stateRoot)
+func Kill(ctx context.Context, id, stateRoot string, sig syscall.Signal, all bool) error {
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	c, err := Load(ctx, id, stateRoot)
 	if err != nil {
 		return fmt.Errorf("load container: %w", err)
 	}
@@ -100,7 +110,7 @@ func Kill(id, stateRoot string, sig syscall.Signal, all bool) error {
 	// Verify container is running
 	c.RefreshStatus()
 	if !c.IsRunning() {
-		return fmt.Errorf("container is not running")
+		return cerrors.WrapWithContainer(nil, cerrors.ErrInvalidState, "kill", id)
 	}
 
 	// Send signal

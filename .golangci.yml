@@ -1,0 +1,118 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    # Default linters
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # Additional linters
+    - bodyclose
+    - dogsled
+    - dupl
+    - exportloopref
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - gocyclo
+    - gofmt
+    - goimports
+    - goprintffuncname
+    - gosec
+    - misspell
+    - nakedret
+    - noctx
+    - nolintlint
+    - prealloc
+    - revive
+    - rowserrcheck
+    - stylecheck
+    - unconvert
+    - unparam
+    - whitespace
+
+linters-settings:
+  gosec:
+    severity: medium
+    confidence: medium
+    excludes:
+      - G104  # Unhandled errors (we have many deferred closes)
+      - G304  # File path from variable (needed for container paths)
+
+  gocyclo:
+    min-complexity: 20
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+      - style
+    disabled-checks:
+      - whyNoLint
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # Performance optimization, not critical
+
+  revive:
+    rules:
+      - name: exported
+        disabled: true  # We have many exported functions for the runtime API
+
+  stylecheck:
+    checks:
+      - all
+      - -ST1000  # Package comments not required
+      - -ST1003  # CamelCase naming (Linux syscalls use underscores)
+
+  misspell:
+    locale: US
+
+  dupl:
+    threshold: 150
+
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+
+issues:
+  exclude-rules:
+    # Exclude test files from some linters
+    - path: _test\.go
+      linters:
+        - dupl
+        - gosec
+        - goconst
+        - gocyclo
+
+    # Exclude syscall usage warnings (we're a container runtime)
+    - path: linux/
+      linters:
+        - gosec
+      text: "G103|G201"
+
+    # Exclude unsafe usage in syscall wrappers
+    - path: (syscalls|capabilities|seccomp)\.go
+      linters:
+        - gosec
+      text: "G103"
+
+    # Allow globals in main for CLI flags
+    - path: main\.go
+      linters:
+        - gochecknoglobals
+
+  max-issues-per-linter: 50
+  max-same-issues: 5
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true

@@ -192,9 +192,46 @@ func ApplyCapabilities(caps *spec.LinuxCapabilities) error {
 		return fmt.Errorf("capset: %v", errno)
 	}
 
+	// Verify capabilities were applied correctly
+	if err := verifyCapabilities(&data); err != nil {
+		return fmt.Errorf("capability verification failed: %w", err)
+	}
+
 	// Set ambient capabilities (must be both permitted and inheritable)
 	if err := applyAmbient(caps.Ambient, caps.Permitted, caps.Inheritable); err != nil {
 		return fmt.Errorf("apply ambient: %w", err)
+	}
+
+	return nil
+}
+
+// verifyCapabilities verifies that capabilities match expected values.
+func verifyCapabilities(expected *[2]capData) error {
+	header := capHeader{Version: LINUX_CAPABILITY_VERSION_3, Pid: 0}
+	actual := [2]capData{}
+
+	_, _, errno := syscall.Syscall(syscall.SYS_CAPGET,
+		uintptr(unsafe.Pointer(&header)),
+		uintptr(unsafe.Pointer(&actual[0])),
+		0)
+	if errno != 0 {
+		return fmt.Errorf("capget: %v", errno)
+	}
+
+	// Verify each capability set
+	for i := 0; i < 2; i++ {
+		if actual[i].Effective != expected[i].Effective {
+			return fmt.Errorf("effective mismatch at [%d]: got 0x%x, expected 0x%x",
+				i, actual[i].Effective, expected[i].Effective)
+		}
+		if actual[i].Permitted != expected[i].Permitted {
+			return fmt.Errorf("permitted mismatch at [%d]: got 0x%x, expected 0x%x",
+				i, actual[i].Permitted, expected[i].Permitted)
+		}
+		if actual[i].Inheritable != expected[i].Inheritable {
+			return fmt.Errorf("inheritable mismatch at [%d]: got 0x%x, expected 0x%x",
+				i, actual[i].Inheritable, expected[i].Inheritable)
+		}
 	}
 
 	return nil

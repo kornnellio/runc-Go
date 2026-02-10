@@ -2,6 +2,7 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"golang.org/x/term"
 
+	cerrors "runc-go/errors"
 	"runc-go/spec"
 )
 
@@ -43,21 +45,28 @@ type ExecOptions struct {
 }
 
 // ExecWithProcessFile executes using a process spec file (Docker/containerd style).
-func ExecWithProcessFile(containerID, stateRoot, processFile string, opts *ExecOptions) error {
+func ExecWithProcessFile(ctx context.Context, containerID, stateRoot, processFile string, opts *ExecOptions) error {
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	// Read and parse the process spec file
 	data, err := os.ReadFile(processFile)
 	if err != nil {
-		return fmt.Errorf("read process file: %w", err)
+		return cerrors.Wrap(err, cerrors.ErrInvalidConfig, "read process file")
 	}
 
 	var process spec.Process
 	if err := json.Unmarshal(data, &process); err != nil {
-		return fmt.Errorf("parse process file: %w", err)
+		return cerrors.Wrap(err, cerrors.ErrInvalidConfig, "parse process file")
 	}
 
 	// Extract args from process spec
 	if len(process.Args) == 0 {
-		return fmt.Errorf("no command in process spec")
+		return cerrors.ErrNoProcessArgs
 	}
 
 	// Update options from process spec
@@ -69,39 +78,46 @@ func ExecWithProcessFile(containerID, stateRoot, processFile string, opts *ExecO
 	}
 	opts.Env = append(opts.Env, process.Env...)
 
-	return Exec(containerID, stateRoot, process.Args, opts)
+	return Exec(ctx, containerID, stateRoot, process.Args, opts)
 }
 
 // Exec executes a new process inside a running container.
-func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error {
+func Exec(ctx context.Context, containerID, stateRoot string, args []string, opts *ExecOptions) error {
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	if opts == nil {
 		opts = &ExecOptions{}
 	}
 
 	if len(args) == 0 {
-		return fmt.Errorf("no command specified")
+		return cerrors.ErrNoProcessArgs
 	}
 
 	// Load container
-	c, err := Load(containerID, stateRoot)
+	c, err := Load(ctx, containerID, stateRoot)
 	if err != nil {
-		return fmt.Errorf("load container: %w", err)
+		return err // Already wrapped by Load
 	}
 
 	// Check if container is running
 	c.RefreshStatus()
 	if c.State.Status != spec.StatusRunning {
-		return fmt.Errorf("container is not running (status: %s)", c.State.Status)
+		return cerrors.WrapWithContainer(nil, cerrors.ErrInvalidState, "exec", containerID)
 	}
 
 	if c.InitProcess <= 0 {
-		return fmt.Errorf("container has no init process")
+		return cerrors.WrapWithContainer(cerrors.ErrNoInitProcess, cerrors.ErrInvalidState, "exec", containerID)
 	}
 
 	// Get path to our own executable for re-exec
 	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("get executable: %w", err)
+		return cerrors.Wrap(err, cerrors.ErrInternal, "get executable")
 	}
 
 	// Build the exec-init command
@@ -139,7 +155,7 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 
 	// Start the process
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start exec process: %w", err)
+		return cerrors.Wrap(err, cerrors.ErrInternal, "start exec process")
 	}
 
 	// Write PID file if requested
@@ -147,7 +163,7 @@ func Exec(containerID, stateRoot string, args []string, opts *ExecOptions) error
 		pidContent := fmt.Sprintf("%d", cmd.Process.Pid)
 		if err := os.WriteFile(opts.PidFile, []byte(pidContent), 0644); err != nil {
 			cmd.Process.Kill()
-			return fmt.Errorf("write pid file: %w", err)
+			return cerrors.Wrap(err, cerrors.ErrPermission, "write pid file")
 		}
 	}
 
@@ -252,13 +268,18 @@ func execWithPTY(cmd *exec.Cmd, opts *ExecOptions) error {
 	}
 
 	// Copy I/O between terminal and PTY
+	// Errors from io.Copy are expected when PTY closes, so we only log unexpected ones
 	go func() {
-		io.Copy(ptmx, os.Stdin)
+		if _, err := io.Copy(ptmx, os.Stdin); err != nil && !isClosedPipeOrEOF(err) {
+			fmt.Fprintf(os.Stderr, "[exec] warning: stdin copy error: %v\n", err)
+		}
 	}()
 
 	outputDone := make(chan struct{})
 	go func() {
-		io.Copy(os.Stdout, ptmx)
+		if _, err := io.Copy(os.Stdout, ptmx); err != nil && !isClosedPipeOrEOF(err) {
+			fmt.Fprintf(os.Stderr, "[exec] warning: stdout copy error: %v\n", err)
+		}
 		close(outputDone)
 	}()
 
@@ -416,12 +437,12 @@ func ExecInit() error {
 	argsStr := os.Getenv("_RUNC_GO_EXEC_ARGS")
 
 	if pidStr == "" || argsStr == "" {
-		return fmt.Errorf("missing exec environment variables")
+		return cerrors.New(cerrors.ErrInvalidConfig, "exec-init", "missing exec environment variables")
 	}
 
 	args := decodeArgs(argsStr)
 	if len(args) == 0 {
-		return fmt.Errorf("no command to execute")
+		return cerrors.ErrNoProcessArgs
 	}
 
 	// Collect additional environment variables
@@ -475,7 +496,7 @@ func ExecInit() error {
 	// Find nsenter
 	nsenterPath, err := exec.LookPath("nsenter")
 	if err != nil {
-		return fmt.Errorf("nsenter not found: %w", err)
+		return cerrors.Wrap(err, cerrors.ErrNotFound, "nsenter not found")
 	}
 
 	// Exec nsenter (replaces this process)
@@ -493,20 +514,45 @@ func getCwd(opts *ExecOptions, c *Container) string {
 	return "/"
 }
 
+// isClosedPipeOrEOF checks if an error is a closed pipe or EOF (expected during PTY close).
+func isClosedPipeOrEOF(err error) bool {
+	if err == io.EOF {
+		return true
+	}
+	// Check for closed pipe/file errors
+	if strings.Contains(err.Error(), "file already closed") ||
+		strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "bad file descriptor") ||
+		strings.Contains(err.Error(), "input/output error") {
+		return true
+	}
+	return false
+}
+
 // encodeArgs encodes command arguments for environment variable passing.
+// Returns empty string on error (caller should validate input).
 func encodeArgs(args []string) string {
 	// Use JSON encoding to handle all characters
-	data, _ := json.Marshal(args)
+	data, err := json.Marshal(args)
+	if err != nil {
+		// This should never happen with string slices, but handle gracefully
+		fmt.Fprintf(os.Stderr, "[exec] warning: failed to encode args: %v\n", err)
+		return ""
+	}
 	return string(data)
 }
 
 // decodeArgs decodes command arguments from environment variable.
+// Returns nil on error (caller should validate result).
 func decodeArgs(encoded string) []string {
 	if encoded == "" {
 		return nil
 	}
 	var args []string
-	json.Unmarshal([]byte(encoded), &args)
+	if err := json.Unmarshal([]byte(encoded), &args); err != nil {
+		fmt.Fprintf(os.Stderr, "[exec] warning: failed to decode args: %v\n", err)
+		return nil
+	}
 	return args
 }
 

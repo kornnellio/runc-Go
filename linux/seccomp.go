@@ -200,16 +200,12 @@ func SetupSeccomp(config *spec.LinuxSeccomp) error {
 		}
 	}
 
-	// If more than 20% of syscalls are unrecognized, skip our incomplete filter
-	// This is a safety measure for Docker integration
+	// If more than 20% of syscalls are unrecognized, fail instead of applying incomplete filter
+	// This prevents silently leaving containers unprotected
 	if unrecognized > 0 && (recognized == 0 || float64(unrecognized)/float64(recognized+unrecognized) > 0.2) {
-		// SECURITY WARNING: Notify user that seccomp filter is being skipped
-		fmt.Printf("[seccomp] WARNING: Skipping seccomp filter - %d of %d syscalls unrecognized (%.1f%%)\n",
+		return fmt.Errorf("seccomp filter incomplete: %d of %d syscalls (%.1f%%) unrecognized - use runtime with full libseccomp support for production",
 			unrecognized, recognized+unrecognized,
 			100*float64(unrecognized)/float64(recognized+unrecognized))
-		fmt.Printf("[seccomp] WARNING: Container may have unrestricted syscall access!\n")
-		fmt.Printf("[seccomp] WARNING: Use a runtime with full libseccomp support for production.\n")
-		return nil
 	}
 
 	// Set no new privileges
@@ -264,16 +260,24 @@ func buildSeccompFilter(config *spec.LinuxSeccomp) ([]sockFilter, error) {
 		arches = []spec.Arch{spec.ArchX86_64}
 	}
 
-	// Jump over kill if arch matches any allowed
-	archChecks := len(arches)
-	for i, arch := range arches {
-		auditArch, ok := archToAudit[arch]
-		if !ok {
-			continue
+	// Build list of valid architectures with their audit values
+	// This ensures correct jump calculations (unknown arches are filtered out first)
+	type archEntry struct {
+		auditArch uint32
+	}
+	var validArches []archEntry
+	for _, arch := range arches {
+		if auditArch, ok := archToAudit[arch]; ok {
+			validArches = append(validArches, archEntry{auditArch})
 		}
+	}
+
+	// Jump over kill if arch matches any allowed
+	for i, entry := range validArches {
 		// Jump past remaining arch checks + kill instruction if match
-		jt := uint8(archChecks - i)
-		filter = append(filter, bpfJump(BPF_JMP|BPF_JEQ|BPF_K, auditArch, jt, 0))
+		// If this is the last arch check, jt=1 jumps over the kill instruction
+		jt := uint8(len(validArches) - i)
+		filter = append(filter, bpfJump(BPF_JMP|BPF_JEQ|BPF_K, entry.auditArch, jt, 0))
 	}
 	// Kill if no arch matched
 	filter = append(filter, bpfStmt(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS))

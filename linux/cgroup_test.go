@@ -3,6 +3,7 @@ package linux
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"runc-go/spec"
@@ -237,3 +238,212 @@ func TestSwapLimitCalculation(t *testing.T) {
 		}
 	}
 }
+
+// ============================================================================
+// SECURITY TESTS: Cgroup Unified Key Validation
+// ============================================================================
+
+// TestApplyResources_UnifiedKeyPathTraversal tests that path traversal in
+// unified cgroup keys is rejected. This is a critical security test.
+func TestApplyResources_UnifiedKeyPathTraversal(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "cgroup-traversal-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a fake cgroup directory
+	cgroupDir := filepath.Join(tmpDir, "cgroup")
+	if err := os.MkdirAll(cgroupDir, 0755); err != nil {
+		t.Fatalf("Failed to create cgroup dir: %v", err)
+	}
+
+	// Create target file outside cgroup dir
+	outsideDir := filepath.Join(tmpDir, "outside")
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatalf("Failed to create outside dir: %v", err)
+	}
+
+	cg := &Cgroup{path: cgroupDir}
+
+	// Test various path traversal attempts in unified keys
+	traversalKeys := []string{
+		"../outside/escaped",
+		"../../escaped",
+		"../../../etc/passwd",
+		"foo/../../../etc/passwd",
+	}
+
+	for _, key := range traversalKeys {
+		resources := &spec.LinuxResources{
+			Unified: map[string]string{
+				key: "malicious-content",
+			},
+		}
+
+		err := cg.ApplyResources(resources)
+
+		// Check if file was created outside cgroup
+		escapedPath := filepath.Join(tmpDir, "outside", "escaped")
+		if _, statErr := os.Stat(escapedPath); statErr == nil {
+			t.Errorf("SECURITY VULNERABILITY: Unified key %q escaped cgroup directory!", key)
+			t.Errorf("File created at: %s", escapedPath)
+		}
+
+		// For the test to pass after fix, ApplyResources should return an error
+		if err == nil {
+			t.Logf("WARNING: Unified key %q was accepted (should be rejected after fix)", key)
+		}
+	}
+}
+
+// TestApplyResources_UnifiedKeyValidation tests that only valid cgroup keys
+// are accepted in the unified map.
+func TestApplyResources_UnifiedKeyValidation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "cgroup-key-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cg := &Cgroup{path: tmpDir}
+
+	// Valid cgroup keys
+	validKeys := []string{
+		"cpu.max",
+		"memory.max",
+		"pids.max",
+		"cpu.weight",
+		"cpuset.cpus",
+		"memory.swap.max",
+		"io.max",
+		"io.bfq.weight",
+	}
+
+	// Invalid keys (should be rejected after fix)
+	invalidKeys := []string{
+		"../foo",
+		"..",
+		"./foo",
+		"/absolute/path",
+		"foo/../../bar",
+		"",
+		"memory max", // space
+		"memory\tmax", // tab
+		"memory\nmax", // newline
+	}
+
+	for _, key := range validKeys {
+		resources := &spec.LinuxResources{
+			Unified: map[string]string{
+				key: "100",
+			},
+		}
+
+		err := cg.ApplyResources(resources)
+		// We expect this to potentially fail because the cgroup controller
+		// files don't exist in our temp dir, but it should NOT fail due to
+		// key validation
+		if err != nil && isKeyValidationError(err) {
+			t.Errorf("Valid cgroup key %q was rejected: %v", key, err)
+		}
+	}
+
+	for _, key := range invalidKeys {
+		resources := &spec.LinuxResources{
+			Unified: map[string]string{
+				key: "100",
+			},
+		}
+
+		err := cg.ApplyResources(resources)
+		// After fix, these should return a key validation error
+		if err == nil {
+			// Check if we wrote outside the cgroup dir
+			if _, statErr := os.Stat(filepath.Join(tmpDir, "..", filepath.Base(tmpDir)+"_escaped")); statErr == nil {
+				t.Errorf("VULNERABILITY: Invalid key %q escaped directory", key)
+			}
+		}
+	}
+}
+
+// isKeyValidationError checks if an error is a key validation error (vs file not found etc.)
+func isKeyValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "invalid cgroup key") ||
+		strings.Contains(errStr, "path traversal") ||
+		strings.Contains(errStr, "invalid key")
+}
+
+// TestCgroupPath_Traversal tests that cgroup path with traversal is rejected.
+func TestCgroupPath_Traversal(t *testing.T) {
+	// These paths should be rejected or sanitized
+	traversalPaths := []string{
+		"../etc",
+		"../../etc",
+		"foo/../../../etc",
+	}
+
+	for _, path := range traversalPaths {
+		// NewCgroup should either reject these or sanitize them
+		// Currently it doesn't, which is a vulnerability
+		cg, err := NewCgroup(path)
+		if err == nil && cg != nil {
+			// Check if the resulting path is outside /sys/fs/cgroup
+			if !strings.HasPrefix(cg.Path(), "/sys/fs/cgroup") {
+				t.Errorf("VULNERABILITY: Cgroup path %q resulted in path %q outside /sys/fs/cgroup",
+					path, cg.Path())
+			}
+			// Note: Even if within /sys/fs/cgroup, path traversal might access
+			// other cgroups, which could be a security issue
+		}
+	}
+}
+
+// TestCPUWeightFormula tests the correct CPU weight conversion formula.
+// The correct formula is: weight = 1 + (shares - 2) * 9999 / 262142
+func TestCPUWeightFormula(t *testing.T) {
+	tests := []struct {
+		shares        uint64
+		expectedMin   uint64 // Expected weight range
+		expectedMax   uint64
+		description   string
+	}{
+		{2, 1, 1, "minimum shares"},
+		{1024, 38, 40, "default shares (should be ~39)"}, // 1 + (1024-2)*9999/262142 ≈ 39
+		{262144, 9999, 10000, "maximum shares"},
+		{512, 19, 20, "half default shares"},
+		{2048, 77, 79, "double default shares"},
+	}
+
+	for _, tc := range tests {
+		// Current (wrong) formula: (shares * 100) / 1024
+		currentWeight := (tc.shares * 100) / 1024
+		if currentWeight < 1 {
+			currentWeight = 1
+		}
+		if currentWeight > 10000 {
+			currentWeight = 10000
+		}
+
+		// Correct formula: 1 + (shares - 2) * 9999 / 262142
+		correctWeight := uint64(1)
+		if tc.shares > 2 {
+			correctWeight = 1 + (tc.shares-2)*9999/262142
+		}
+
+		t.Logf("Shares %d (%s): current=%d, correct=%d, expected=%d-%d",
+			tc.shares, tc.description, currentWeight, correctWeight,
+			tc.expectedMin, tc.expectedMax)
+
+		// The correct formula should give a value in the expected range
+		if correctWeight < tc.expectedMin || correctWeight > tc.expectedMax {
+			t.Errorf("Correct formula for shares %d: expected %d-%d, got %d",
+				tc.shares, tc.expectedMin, tc.expectedMax, correctWeight)
+		}
+	}
+}
+

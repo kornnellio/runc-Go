@@ -2,6 +2,7 @@
 package container
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,12 +20,12 @@ type DeleteOptions struct {
 }
 
 // Delete removes a container.
-func Delete(id, stateRoot string, opts *DeleteOptions) error {
+func Delete(ctx context.Context, id, stateRoot string, opts *DeleteOptions) error {
 	if opts == nil {
 		opts = &DeleteOptions{}
 	}
 
-	c, err := Load(id, stateRoot)
+	c, err := Load(ctx, id, stateRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // Already deleted
@@ -47,7 +48,7 @@ func Delete(id, stateRoot string, opts *DeleteOptions) error {
 		}
 
 		// Wait for process to exit
-		waitForExit(c.InitProcess, 5*time.Second)
+		waitForExit(ctx, c.InitProcess, 5*time.Second)
 	}
 
 	// Clean up cgroup
@@ -72,9 +73,14 @@ func Delete(id, stateRoot string, opts *DeleteOptions) error {
 }
 
 // waitForExit waits for a process to exit with a timeout.
-func waitForExit(pid int, timeout time.Duration) {
+func waitForExit(ctx context.Context, pid int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		err := syscall.Kill(pid, 0)
 		if err != nil {
 			return // Process exited
@@ -84,7 +90,7 @@ func waitForExit(pid int, timeout time.Duration) {
 }
 
 // Cleanup removes all state for containers that are no longer running.
-func Cleanup(stateRoot string) error {
+func Cleanup(ctx context.Context, stateRoot string) error {
 	if stateRoot == "" {
 		stateRoot = DefaultStateDir
 	}
@@ -98,11 +104,17 @@ func Cleanup(stateRoot string) error {
 	}
 
 	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if !entry.IsDir() {
 			continue
 		}
 
-		c, err := Load(entry.Name(), stateRoot)
+		c, err := Load(ctx, entry.Name(), stateRoot)
 		if err != nil {
 			// Remove invalid state
 			os.RemoveAll(filepath.Join(stateRoot, entry.Name()))
@@ -111,7 +123,7 @@ func Cleanup(stateRoot string) error {
 
 		c.RefreshStatus()
 		if c.State.Status == spec.StatusStopped {
-			Delete(c.ID, stateRoot, &DeleteOptions{Force: true})
+			Delete(ctx, c.ID, stateRoot, &DeleteOptions{Force: true})
 		}
 	}
 

@@ -2,14 +2,18 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"syscall"
 	"time"
 
+	cerrors "runc-go/errors"
+	"runc-go/logging"
 	"runc-go/spec"
 )
 
@@ -20,17 +24,20 @@ var containerIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 // ValidateContainerID checks that a container ID is safe and valid.
 func ValidateContainerID(id string) error {
 	if id == "" {
-		return fmt.Errorf("container ID cannot be empty")
+		return cerrors.ErrEmptyContainerID
 	}
 	if len(id) > 1024 {
-		return fmt.Errorf("container ID too long (max 1024 characters)")
+		return cerrors.WrapWithDetail(nil, cerrors.ErrInvalidConfig, "validate",
+			fmt.Sprintf("container ID too long (max 1024 characters): %d", len(id)))
 	}
 	if !containerIDRegex.MatchString(id) {
-		return fmt.Errorf("container ID %q contains invalid characters (must be alphanumeric with _.-)", id)
+		return cerrors.WrapWithDetail(nil, cerrors.ErrInvalidConfig, "validate",
+			fmt.Sprintf("container ID %q contains invalid characters (must be alphanumeric with _.-)", id))
 	}
 	// Explicitly check for path traversal attempts
 	if id == "." || id == ".." || filepath.Clean(id) != id {
-		return fmt.Errorf("container ID %q contains path traversal", id)
+		return cerrors.WrapWithDetail(cerrors.ErrPathTraversal, cerrors.ErrInvalidConfig, "validate",
+			fmt.Sprintf("container ID %q contains path traversal", id))
 	}
 	return nil
 }
@@ -48,6 +55,9 @@ const (
 
 // Container represents an OCI container.
 type Container struct {
+	// mu protects concurrent access to container state.
+	mu sync.RWMutex
+
 	// ID is the unique identifier for the container.
 	ID string
 
@@ -71,7 +81,14 @@ type Container struct {
 }
 
 // Load loads an existing container by ID.
-func Load(id string, stateRoot string) (*Container, error) {
+func Load(ctx context.Context, id string, stateRoot string) (*Container, error) {
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	// Validate container ID to prevent path traversal
 	if err := ValidateContainerID(id); err != nil {
 		return nil, err
@@ -86,7 +103,10 @@ func Load(id string, stateRoot string) (*Container, error) {
 
 	state, err := spec.LoadState(statePath)
 	if err != nil {
-		return nil, fmt.Errorf("load state: %w", err)
+		if os.IsNotExist(err) {
+			return nil, cerrors.WrapWithContainer(err, cerrors.ErrNotFound, "load", id)
+		}
+		return nil, cerrors.WrapWithContainer(err, cerrors.ErrInternal, "load state", id)
 	}
 
 	c := &Container{
@@ -102,7 +122,7 @@ func Load(id string, stateRoot string) (*Container, error) {
 	loadedSpec, err := spec.LoadSpec(specPath)
 	if err != nil {
 		// Log warning but don't fail - spec may not be needed for all operations
-		fmt.Printf("[container] warning: could not load spec: %v\n", err)
+		logging.WarnContext(ctx, "could not load spec", "container_id", id, "path", specPath, "error", err)
 	}
 	c.Spec = loadedSpec
 
@@ -110,7 +130,14 @@ func Load(id string, stateRoot string) (*Container, error) {
 }
 
 // New creates a new container instance (doesn't start it yet).
-func New(id, bundle, stateRoot string) (*Container, error) {
+func New(ctx context.Context, id, bundle, stateRoot string) (*Container, error) {
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	// Validate container ID to prevent path traversal
 	if err := ValidateContainerID(id); err != nil {
 		return nil, err
@@ -123,26 +150,29 @@ func New(id, bundle, stateRoot string) (*Container, error) {
 	// Validate bundle
 	bundle, err := filepath.Abs(bundle)
 	if err != nil {
-		return nil, fmt.Errorf("abs bundle path: %w", err)
+		return nil, cerrors.Wrap(err, cerrors.ErrInvalidConfig, "abs bundle path")
 	}
 
 	// Load OCI spec
 	specPath := filepath.Join(bundle, "config.json")
 	s, err := spec.LoadSpec(specPath)
 	if err != nil {
-		return nil, fmt.Errorf("load spec: %w", err)
+		if os.IsNotExist(err) {
+			return nil, cerrors.Wrap(err, cerrors.ErrInvalidConfig, "load spec")
+		}
+		return nil, cerrors.Wrap(err, cerrors.ErrInvalidConfig, "parse spec")
 	}
 
 	// Create state directory
 	stateDir := filepath.Join(stateRoot, id)
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
-		return nil, fmt.Errorf("create state dir: %w", err)
+		return nil, cerrors.Wrap(err, cerrors.ErrPermission, "create state dir")
 	}
 
 	// Check if container already exists
 	statePath := filepath.Join(stateDir, StateFileName)
 	if _, err := os.Stat(statePath); err == nil {
-		return nil, fmt.Errorf("container %s already exists", id)
+		return nil, cerrors.WrapWithContainer(nil, cerrors.ErrAlreadyExists, "create", id)
 	}
 
 	c := &Container{
@@ -175,55 +205,97 @@ func New(id, bundle, stateRoot string) (*Container, error) {
 }
 
 // SaveState saves the container state to disk.
+// This method is thread-safe.
 func (c *Container) SaveState() error {
+	c.mu.RLock()
 	statePath := filepath.Join(c.StateDir, StateFileName)
-	return c.State.Save(statePath)
+	// Make a copy of state for safe serialization outside the lock
+	stateCopy := *c.State
+	c.mu.RUnlock()
+	return stateCopy.Save(statePath)
 }
 
 // GetState returns the OCI-compliant state.
+// This method is thread-safe. Returns a deep copy so callers can safely serialize.
 func (c *Container) GetState() *spec.State {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Update PID from actual process if running
 	if c.State.Status == spec.StatusRunning {
 		c.State.Pid = c.InitProcess
 	}
-	return c.State.ToOCIState()
+	state := c.State.ToOCIState()
+	// Return a deep copy to avoid race during serialization
+	stateCopy := *state
+	// Deep copy the Annotations map
+	if state.Annotations != nil {
+		stateCopy.Annotations = make(map[string]string, len(state.Annotations))
+		for k, v := range state.Annotations {
+			stateCopy.Annotations[k] = v
+		}
+	}
+	return &stateCopy
 }
 
 // UpdateStatus updates the container status.
+// This method is thread-safe.
 func (c *Container) UpdateStatus(status spec.ContainerStatus) error {
+	c.mu.Lock()
 	c.State.Status = status
-	return c.SaveState()
+	statePath := filepath.Join(c.StateDir, StateFileName)
+	// Make a copy of state for safe serialization outside the lock
+	stateCopy := *c.State
+	c.mu.Unlock()
+	return stateCopy.Save(statePath)
 }
 
 // IsRunning checks if the container process is still running.
+// This method is thread-safe.
 func (c *Container) IsRunning() bool {
-	if c.InitProcess <= 0 {
+	c.mu.RLock()
+	pid := c.InitProcess
+	c.mu.RUnlock()
+
+	if pid <= 0 {
 		return false
 	}
 
 	// Check if process exists by sending signal 0
-	err := syscall.Kill(c.InitProcess, 0)
+	err := syscall.Kill(pid, 0)
 	return err == nil
 }
 
 // RefreshStatus updates status based on actual process state.
+// This method is thread-safe.
 func (c *Container) RefreshStatus() {
+	// Check if process is running first (uses its own lock)
+	isRunning := c.IsRunning()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	switch c.State.Status {
 	case spec.StatusRunning:
-		if !c.IsRunning() {
+		if !isRunning {
 			c.State.Status = spec.StatusStopped
 		}
 	case spec.StatusCreated:
-		if !c.IsRunning() {
+		if !isRunning {
 			c.State.Status = spec.StatusStopped
 		}
 	}
 }
 
 // Destroy removes all container state and resources.
+// This method is thread-safe.
 func (c *Container) Destroy() error {
+	c.mu.RLock()
+	stateDir := c.StateDir
+	c.mu.RUnlock()
+
 	// Remove state directory
-	return os.RemoveAll(c.StateDir)
+	return os.RemoveAll(stateDir)
 }
 
 // ExecFifoPath returns the path to the exec FIFO.
@@ -235,13 +307,13 @@ func (c *Container) ExecFifoPath() string {
 func (c *Container) CreateExecFifo() error {
 	fifoPath := c.ExecFifoPath()
 	if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
-		return fmt.Errorf("mkfifo: %w", err)
+		return cerrors.WrapWithContainer(err, cerrors.ErrResource, "create exec fifo", c.ID)
 	}
 	return nil
 }
 
 // List returns all containers in the state directory.
-func List(stateRoot string) ([]*Container, error) {
+func List(ctx context.Context, stateRoot string) ([]*Container, error) {
 	if stateRoot == "" {
 		stateRoot = DefaultStateDir
 	}
@@ -256,11 +328,18 @@ func List(stateRoot string) ([]*Container, error) {
 
 	var containers []*Container
 	for _, entry := range entries {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		if !entry.IsDir() {
 			continue
 		}
 
-		c, err := Load(entry.Name(), stateRoot)
+		c, err := Load(ctx, entry.Name(), stateRoot)
 		if err != nil {
 			continue // Skip invalid containers
 		}
@@ -274,24 +353,43 @@ func List(stateRoot string) ([]*Container, error) {
 }
 
 // StateJSON returns the container state as JSON.
+// This method is thread-safe.
 func (c *Container) StateJSON() ([]byte, error) {
 	c.RefreshStatus()
 	return json.MarshalIndent(c.GetState(), "", "  ")
 }
 
 // Signal sends a signal to the container's init process.
+// This method is thread-safe.
 func (c *Container) Signal(sig syscall.Signal) error {
-	if c.InitProcess <= 0 {
-		return fmt.Errorf("no init process")
+	c.mu.RLock()
+	pid := c.InitProcess
+	id := c.ID
+	c.mu.RUnlock()
+
+	if pid <= 0 {
+		return cerrors.WrapWithContainer(nil, cerrors.ErrInvalidState, "signal", id)
 	}
-	return syscall.Kill(c.InitProcess, sig)
+	if err := syscall.Kill(pid, sig); err != nil {
+		return cerrors.WrapWithContainer(err, cerrors.ErrInternal, "signal", id)
+	}
+	return nil
 }
 
 // SignalAll sends a signal to all processes in the container.
+// This method is thread-safe.
 func (c *Container) SignalAll(sig syscall.Signal) error {
+	c.mu.RLock()
+	pid := c.InitProcess
+	id := c.ID
+	c.mu.RUnlock()
+
 	// Send to process group
-	if c.InitProcess <= 0 {
-		return fmt.Errorf("no init process")
+	if pid <= 0 {
+		return cerrors.WrapWithContainer(nil, cerrors.ErrInvalidState, "signal all", id)
 	}
-	return syscall.Kill(-c.InitProcess, sig)
+	if err := syscall.Kill(-pid, sig); err != nil {
+		return cerrors.WrapWithContainer(err, cerrors.ErrInternal, "signal all", id)
+	}
+	return nil
 }

@@ -5,11 +5,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"runc-go/spec"
 )
+
+// validCgroupKey matches valid cgroup v2 controller file names.
+// Valid keys are like: cpu.max, memory.max, pids.max, io.bfq.weight
+var validCgroupKey = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9]*(\.[a-zA-Z][a-zA-Z0-9]*)*$`)
 
 const cgroupRoot = "/sys/fs/cgroup"
 
@@ -67,6 +72,11 @@ func (c *Cgroup) ApplyResources(resources *spec.LinuxResources) error {
 
 	// Apply unified cgroup v2 settings directly
 	for key, value := range resources.Unified {
+		// SECURITY: Validate cgroup key to prevent path traversal
+		if err := validateCgroupKey(key); err != nil {
+			return fmt.Errorf("invalid cgroup key %q: %w", key, err)
+		}
+
 		path := filepath.Join(c.path, key)
 		if err := os.WriteFile(path, []byte(value), 0644); err != nil {
 			return fmt.Errorf("write %s: %w", key, err)
@@ -143,11 +153,13 @@ func (c *Cgroup) applyCPU(cpu *spec.LinuxCPU) error {
 
 	// cpu.weight (replaces cpu.shares)
 	if cpu.Shares != nil && *cpu.Shares > 0 {
-		// Convert shares to weight: weight = 1 + (shares - 2) * 9999 / 262142
-		// Simplified: weight ~= shares / 10 (shares range 2-262144, weight 1-10000)
-		weight := (*cpu.Shares * 100) / 1024
-		if weight < 1 {
-			weight = 1
+		// Convert shares to weight using the correct formula:
+		// weight = 1 + (shares - 2) * 9999 / 262142
+		// This maps shares (2-262144) to weight (1-10000)
+		shares := *cpu.Shares
+		var weight uint64 = 1
+		if shares > 2 {
+			weight = 1 + (shares-2)*9999/262142
 		}
 		if weight > 10000 {
 			weight = 10000
@@ -254,4 +266,35 @@ func GetCgroupPath(containerID string, specPath string) string {
 		return specPath
 	}
 	return filepath.Join("runc-go", containerID)
+}
+
+// validateCgroupKey validates a cgroup controller file key.
+// This prevents path traversal attacks via crafted unified keys.
+func validateCgroupKey(key string) error {
+	// Empty key is invalid
+	if key == "" {
+		return fmt.Errorf("empty key not allowed")
+	}
+
+	// Must not contain path separators
+	if strings.ContainsAny(key, "/\\") {
+		return fmt.Errorf("key contains path separator")
+	}
+
+	// Must not be . or ..
+	if key == "." || key == ".." {
+		return fmt.Errorf("key is relative path component")
+	}
+
+	// Must not start with .
+	if strings.HasPrefix(key, ".") {
+		return fmt.Errorf("key starts with dot")
+	}
+
+	// Must match valid cgroup key pattern (e.g., cpu.max, memory.swap.max)
+	if !validCgroupKey.MatchString(key) {
+		return fmt.Errorf("key does not match valid cgroup key pattern")
+	}
+
+	return nil
 }

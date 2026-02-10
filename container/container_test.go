@@ -1,8 +1,10 @@
 package container
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"runc-go/spec"
@@ -54,7 +56,8 @@ func TestNew(t *testing.T) {
 	}
 
 	// Create container
-	c, err := New("test-container", bundleDir, stateRoot)
+	ctx := context.Background()
+	c, err := New(ctx, "test-container", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -100,9 +103,10 @@ func TestNewDuplicateContainer(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
 	// Create first container
-	c1, err := New("duplicate-test", bundleDir, stateRoot)
+	c1, err := New(ctx, "duplicate-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("first New failed: %v", err)
 	}
@@ -113,7 +117,7 @@ func TestNewDuplicateContainer(t *testing.T) {
 	}
 
 	// Try to create duplicate
-	_, err = New("duplicate-test", bundleDir, stateRoot)
+	_, err = New(ctx, "duplicate-test", bundleDir, stateRoot)
 	if err == nil {
 		t.Error("expected error for duplicate container")
 	}
@@ -126,7 +130,8 @@ func TestNewInvalidBundle(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	_, err = New("test", "/nonexistent/bundle", tmpDir)
+	ctx := context.Background()
+	_, err = New(ctx, "test", "/nonexistent/bundle", tmpDir)
 	if err == nil {
 		t.Error("expected error for invalid bundle")
 	}
@@ -150,9 +155,10 @@ func TestLoad(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
 	// Create and save container
-	c, err := New("load-test", bundleDir, stateRoot)
+	c, err := New(ctx, "load-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -166,7 +172,7 @@ func TestLoad(t *testing.T) {
 	}
 
 	// Load container
-	loaded, err := Load("load-test", stateRoot)
+	loaded, err := Load(ctx, "load-test", stateRoot)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -191,7 +197,8 @@ func TestLoadNotFound(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	_, err = Load("nonexistent", tmpDir)
+	ctx := context.Background()
+	_, err = Load(ctx, "nonexistent", tmpDir)
 	if err == nil {
 		t.Error("expected error for nonexistent container")
 	}
@@ -215,8 +222,9 @@ func TestSaveState(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
-	c, err := New("save-test", bundleDir, stateRoot)
+	c, err := New(ctx, "save-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -256,8 +264,9 @@ func TestUpdateStatus(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
-	c, err := New("status-test", bundleDir, stateRoot)
+	c, err := New(ctx, "status-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -271,7 +280,7 @@ func TestUpdateStatus(t *testing.T) {
 	}
 
 	// Reload and verify
-	loaded, err := Load("status-test", stateRoot)
+	loaded, err := Load(ctx, "status-test", stateRoot)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -299,8 +308,9 @@ func TestGetState(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
-	c, err := New("getstate-test", bundleDir, stateRoot)
+	c, err := New(ctx, "getstate-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -348,8 +358,9 @@ func TestDestroy(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
-	c, err := New("destroy-test", bundleDir, stateRoot)
+	c, err := New(ctx, "destroy-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -422,8 +433,9 @@ func TestStateJSON(t *testing.T) {
 	}
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
-	c, err := New("json-test", bundleDir, stateRoot)
+	c, err := New(ctx, "json-test", bundleDir, stateRoot)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -451,9 +463,10 @@ func TestList(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
 
 	// List on non-existent directory should return empty
-	containers, err := List(stateRoot)
+	containers, err := List(ctx, stateRoot)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
@@ -479,7 +492,7 @@ func TestList(t *testing.T) {
 
 	// Create some containers
 	for i := 0; i < 3; i++ {
-		c, err := New("list-test-"+string(rune('a'+i)), bundleDir, stateRoot)
+		c, err := New(ctx, "list-test-"+string(rune('a'+i)), bundleDir, stateRoot)
 		if err != nil {
 			t.Fatalf("New failed: %v", err)
 		}
@@ -488,7 +501,7 @@ func TestList(t *testing.T) {
 		}
 	}
 
-	containers, err = List(stateRoot)
+	containers, err = List(ctx, stateRoot)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
@@ -499,8 +512,9 @@ func TestList(t *testing.T) {
 }
 
 func TestListDefaultStateRoot(t *testing.T) {
+	ctx := context.Background()
 	// Test that empty stateRoot uses default
-	_, err := List("")
+	_, err := List(ctx, "")
 	// This might fail if /run/runc-go doesn't exist, which is expected
 	// The important thing is that it tries the default path
 	_ = err
@@ -564,5 +578,299 @@ func TestDeleteOptions(t *testing.T) {
 
 	if !opts.Force {
 		t.Errorf("Force should be true")
+	}
+}
+
+// ============================================================================
+// CONCURRENCY RACE TESTS
+// These tests verify that the Container methods are safe for concurrent use.
+// Run with: go test -race ./container/...
+// ============================================================================
+
+// TestContainer_ConcurrentStateUpdate tests concurrent status updates.
+func TestContainer_ConcurrentStateUpdate(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "runc-go-race-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	if err := os.MkdirAll(filepath.Join(bundleDir, "rootfs"), 0755); err != nil {
+		t.Fatalf("failed to create dirs: %v", err)
+	}
+
+	s := spec.DefaultSpec()
+	if err := s.Save(filepath.Join(bundleDir, "config.json")); err != nil {
+		t.Fatalf("failed to write config.json: %v", err)
+	}
+
+	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
+
+	c, err := New(ctx, "race-status-test", bundleDir, stateRoot)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if err := c.SaveState(); err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	// Spawn multiple goroutines updating status concurrently
+	var wg sync.WaitGroup
+	statuses := []spec.ContainerStatus{
+		spec.StatusCreating,
+		spec.StatusCreated,
+		spec.StatusRunning,
+		spec.StatusStopped,
+	}
+
+	// 10 goroutines racing to update status
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				status := statuses[(idx+j)%len(statuses)]
+				_ = c.UpdateStatus(status)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify container is in a valid state (no panic, no data corruption)
+	state := c.GetState()
+	if state == nil {
+		t.Error("GetState returned nil after concurrent updates")
+	}
+}
+
+// TestContainer_ConcurrentRefreshStatus tests concurrent RefreshStatus calls.
+func TestContainer_ConcurrentRefreshStatus(t *testing.T) {
+	c := &Container{
+		ID:          "race-refresh-test",
+		InitProcess: os.Getpid(), // Use our own PID for valid process check
+		State: &spec.ContainerState{
+			State: spec.State{
+				ID:     "race-refresh-test",
+				Status: spec.StatusRunning,
+			},
+		},
+	}
+
+	var wg sync.WaitGroup
+
+	// 10 goroutines racing to refresh status
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				c.RefreshStatus()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify no data corruption
+	state := c.GetState()
+	if state == nil {
+		t.Error("GetState returned nil after concurrent refresh")
+	}
+}
+
+// TestContainer_ConcurrentIsRunning tests concurrent IsRunning calls.
+func TestContainer_ConcurrentIsRunning(t *testing.T) {
+	c := &Container{
+		ID:          "race-isrunning-test",
+		InitProcess: os.Getpid(),
+	}
+
+	var wg sync.WaitGroup
+
+	// 10 goroutines racing to check IsRunning
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = c.IsRunning()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestContainer_ConcurrentGetState tests concurrent GetState calls.
+func TestContainer_ConcurrentGetState(t *testing.T) {
+	c := &Container{
+		ID:          "race-getstate-test",
+		InitProcess: 12345,
+		State: &spec.ContainerState{
+			State: spec.State{
+				ID:     "race-getstate-test",
+				Status: spec.StatusRunning,
+				Pid:    12345,
+				Bundle: "/test/bundle",
+			},
+		},
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan *spec.State, 100)
+
+	// 10 goroutines racing to get state
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				state := c.GetState()
+				results <- state
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Verify all results are consistent
+	count := 0
+	for state := range results {
+		if state == nil {
+			t.Error("GetState returned nil")
+			continue
+		}
+		if state.ID != "race-getstate-test" {
+			t.Errorf("ID mismatch: got %s", state.ID)
+		}
+		count++
+	}
+
+	if count != 100 {
+		t.Errorf("expected 100 results, got %d", count)
+	}
+}
+
+// TestContainer_ConcurrentSignal tests concurrent Signal calls.
+func TestContainer_ConcurrentSignal(t *testing.T) {
+	c := &Container{
+		ID:          "race-signal-test",
+		InitProcess: os.Getpid(), // Use our own PID
+	}
+
+	var wg sync.WaitGroup
+
+	// 10 goroutines racing to send signal 0 (which just checks if process exists)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				// Signal 0 doesn't actually send a signal, just checks if process exists
+				_ = c.Signal(0)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestContainer_ConcurrentMixedOperations tests a mix of concurrent operations.
+func TestContainer_ConcurrentMixedOperations(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "runc-go-race-mixed-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	if err := os.MkdirAll(filepath.Join(bundleDir, "rootfs"), 0755); err != nil {
+		t.Fatalf("failed to create dirs: %v", err)
+	}
+
+	s := spec.DefaultSpec()
+	if err := s.Save(filepath.Join(bundleDir, "config.json")); err != nil {
+		t.Fatalf("failed to write config.json: %v", err)
+	}
+
+	stateRoot := filepath.Join(tmpDir, "state")
+	ctx := context.Background()
+
+	c, err := New(ctx, "race-mixed-test", bundleDir, stateRoot)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	c.InitProcess = os.Getpid()
+	if err := c.SaveState(); err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	// Writers - updating status
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = c.UpdateStatus(spec.StatusRunning)
+			}
+		}()
+	}
+
+	// Readers - getting state
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = c.GetState()
+			}
+		}()
+	}
+
+	// Refreshers
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				c.RefreshStatus()
+			}
+		}()
+	}
+
+	// IsRunning checkers
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = c.IsRunning()
+			}
+		}()
+	}
+
+	// StateJSON callers
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_, _ = c.StateJSON()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Final verification
+	state := c.GetState()
+	if state == nil {
+		t.Error("GetState returned nil after mixed concurrent operations")
 	}
 }

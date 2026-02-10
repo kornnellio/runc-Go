@@ -2,6 +2,7 @@
 package container
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	cerrors "runc-go/errors"
 	"runc-go/linux"
 	"runc-go/spec"
 	"runc-go/utils"
@@ -31,14 +33,32 @@ type CreateOptions struct {
 
 // Create creates a container but doesn't start the user process.
 // The container will be in "created" state, waiting for Start().
-func (c *Container) Create(opts *CreateOptions) error {
+func (c *Container) Create(ctx context.Context, opts *CreateOptions) error {
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	if opts == nil {
 		opts = &CreateOptions{}
 	}
 
 	// Create exec FIFO for synchronization
 	if err := c.CreateExecFifo(); err != nil {
-		return fmt.Errorf("create exec fifo: %w", err)
+		return cerrors.Wrap(err, cerrors.ErrResource, "create exec fifo")
+	}
+
+	// Cleanup function to call on error after FIFO is created
+	var cgroup *linux.Cgroup
+	cleanup := func() {
+		// Remove FIFO
+		os.Remove(c.ExecFifoPath())
+		// Destroy cgroup if created
+		if cgroup != nil {
+			cgroup.Destroy()
+		}
 	}
 
 	// Setup cgroup
@@ -52,14 +72,17 @@ func (c *Container) Create(opts *CreateOptions) error {
 	linux.EnsureParentControllers(cgroupPath)
 
 	// Create cgroup
-	cgroup, err := linux.NewCgroup(cgroupPath)
+	var err error
+	cgroup, err = linux.NewCgroup(cgroupPath)
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("create cgroup: %w", err)
 	}
 
 	// Apply resource limits
 	if c.Spec.Linux != nil && c.Spec.Linux.Resources != nil {
 		if err := cgroup.ApplyResources(c.Spec.Linux.Resources); err != nil {
+			cleanup()
 			return fmt.Errorf("apply resources: %w", err)
 		}
 	}
@@ -129,6 +152,7 @@ func (c *Container) Create(opts *CreateOptions) error {
 		if console != nil {
 			console.Close()
 		}
+		cleanup()
 		return fmt.Errorf("start init: %w", err)
 	}
 
@@ -140,6 +164,7 @@ func (c *Container) Create(opts *CreateOptions) error {
 			if consoleSlave != nil {
 				consoleSlave.Close()
 			}
+			cleanup()
 			return fmt.Errorf("send console to socket: %w", err)
 		}
 		console.Close() // Parent doesn't need master anymore
@@ -154,6 +179,7 @@ func (c *Container) Create(opts *CreateOptions) error {
 	// Add process to cgroup
 	if err := cgroup.AddProcess(c.InitProcess); err != nil {
 		cmd.Process.Kill()
+		cleanup()
 		return fmt.Errorf("add to cgroup: %w", err)
 	}
 
@@ -161,6 +187,7 @@ func (c *Container) Create(opts *CreateOptions) error {
 	if opts.PidFile != "" {
 		if err := os.WriteFile(opts.PidFile, []byte(fmt.Sprintf("%d", c.InitProcess)), 0644); err != nil {
 			cmd.Process.Kill()
+			cleanup()
 			return fmt.Errorf("write pid file: %w", err)
 		}
 	}
@@ -169,6 +196,7 @@ func (c *Container) Create(opts *CreateOptions) error {
 	c.State.Status = spec.StatusCreated
 	if err := c.SaveState(); err != nil {
 		cmd.Process.Kill()
+		cleanup()
 		return fmt.Errorf("save state: %w", err)
 	}
 
@@ -267,7 +295,9 @@ func InitContainer() error {
 	if err := syscall.Fstat(0, &stat); err == nil {
 		if stat.Mode&syscall.S_IFCHR != 0 {
 			os.Remove("/dev/console")
-			syscall.Mknod("/dev/console", syscall.S_IFCHR|0600, int(stat.Rdev))
+			if err := syscall.Mknod("/dev/console", syscall.S_IFCHR|0600, int(stat.Rdev)); err != nil {
+				fmt.Printf("[init] warning: failed to create /dev/console: %v\n", err)
+			}
 		}
 	}
 
@@ -341,18 +371,30 @@ func InitContainer() error {
 	// PID 1 in Linux ignores signals without handlers, so we must catch and forward them
 	sigChan := make(chan os.Signal, 10)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+
+	// Signal forwarding goroutine
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for sig := range sigChan {
-			cmd.Process.Signal(sig)
+			// Ignore errors - process may have exited
+			_ = cmd.Process.Signal(sig)
 		}
 	}()
 
 	// Wait for child to exit and propagate its exit code
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	waitErr := cmd.Wait()
+
+	// Stop signal forwarding and clean up
+	signal.Stop(sigChan)
+	close(sigChan)
+	<-done // Wait for goroutine to finish
+
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		return err
+		return waitErr
 	}
 	os.Exit(0)
 	return nil // unreachable
@@ -376,7 +418,10 @@ func setUser(user spec.User) error {
 		for i, g := range user.AdditionalGids {
 			gids[i] = int(g)
 		}
-		// Note: setgroups might fail in user namespaces
+		// setgroups might fail in user namespaces, log warning but don't fail
+		if err := setGroups(gids); err != nil {
+			fmt.Printf("[init] warning: setgroups failed (expected in user namespaces): %v\n", err)
+		}
 	}
 
 	// Set GID first (must be before UID)

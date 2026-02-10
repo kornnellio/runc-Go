@@ -4,6 +4,7 @@ package spec
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -80,13 +81,58 @@ func LoadState(path string) (*ContainerState, error) {
 	return &state, nil
 }
 
-// Save writes the container state to a JSON file.
+// Save writes the container state to a JSON file atomically.
+// Uses temp file + rename pattern to prevent corruption on crash.
 func (s *ContainerState) Save(path string) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+
+	// Create temp file in same directory (ensures same filesystem for atomic rename)
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+
+	// Ensure temp file is cleaned up on error
+	success := false
+	defer func() {
+		if !success {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	// Write data to temp file
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return err
+	}
+
+	// Sync to ensure data is on disk before rename
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return err
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	// Set permissions
+	if err := os.Chmod(tmpPath, 0600); err != nil {
+		return err
+	}
+
+	// Atomic rename (on POSIX systems)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	success = true
+	return nil
 }
 
 // ToOCIState returns just the OCI-compliant state portion.

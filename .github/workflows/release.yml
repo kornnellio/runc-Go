@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build release binaries
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build \
+              -ldflags="-s -w -X main.version=${VERSION}" \
+              -o runc-go-linux-$arch .
+
+            # Create checksum
+            sha256sum runc-go-linux-$arch > runc-go-linux-$arch.sha256
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            runc-go-linux-amd64
+            runc-go-linux-amd64.sha256
+            runc-go-linux-arm64
+            runc-go-linux-arm64.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
